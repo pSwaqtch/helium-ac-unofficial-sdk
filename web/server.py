@@ -21,11 +21,14 @@ import requests, os, sys
 # cloud MQTT control (mutual-TLS to AWS IoT); lives one dir up
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import helium_cloud
+import ble_bridge
 
 API = "https://o7sbv8y912.execute-api.ap-south-1.amazonaws.com/dev"
 # the 'hoags' backend (different service) — where cloud devices actually live
 HOAGS = "https://tz1z01inlb.execute-api.ap-south-1.amazonaws.com/hoags"
-app = Flask(__name__, static_folder=".", static_url_path="")
+# the built SPA (vite `npm run build` in web/); assets are hashed under dist/assets
+DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist")
+app = Flask(__name__, static_folder=DIST, static_url_path="")
 
 # in-memory token store (single user, local use)
 SESSION = {"access": None, "id": None, "refresh": None, "phone": None, "hoagsUserId": None}
@@ -113,55 +116,121 @@ def session():
     return jsonify({"loggedIn": bool(SESSION["access"]), "phone": SESSION["phone"]})
 
 
-# ---- cloud MQTT control (AWS IoT mutual-TLS; no account token needed) ----
+# ---- AC control over either transport (cloud MQTT / BLE) ----
+# Both transports take the SAME payload bytes (PROTOCOL §7j), so every command is
+# built once with helium_cloud's builders and then routed by `transport`.
+
+COMMANDS = {
+    "temperature":     lambda v: helium_cloud.temperature_payload(int(v)),
+    "power":           lambda v: helium_cloud.power_payload(bool(v)),
+    "fan":             lambda v: helium_cloud.fan_payload(str(v)),
+    "mode":            lambda v: helium_cloud.mode_payload(str(v)),
+    "verticalSwing":   lambda v: helium_cloud.vertical_swing_payload(bool(v)),
+    "turbo":           lambda v: helium_cloud.turbo_payload(bool(v)),
+    "sleep":           lambda v: helium_cloud.sleep_payload(bool(v)),
+    "display":         lambda v: helium_cloud.display_payload(bool(v)),
+    "convertible":     lambda v: helium_cloud.convertible_payload(int(v)),
+    "silent":          lambda v: helium_cloud.silent_payload(bool(v)),
+    "horizontalSwing": lambda v: helium_cloud.horizontal_swing_payload(bool(v)),
+    # timer takes {"timer": {"minutes": 30, "on": true}}
+    "timer":           lambda v: helium_cloud.timer_payload(int(v["minutes"]),
+                                                            bool(v.get("on", True))),
+}
+
+
+def transport_of(body=None):
+    """`transport` from the query string or the JSON body; defaults to cloud."""
+    t = request.args.get("transport") or (body or {}).get("transport") or "cloud"
+    if t not in ("ble", "cloud"):
+        raise ValueError(f"unknown transport {t!r}")
+    return t
+
 
 @app.get("/api/ac/state")
 def ac_state():
-    """Read the AC's live state over cloud MQTT."""
+    """Read the AC's live state over the selected transport."""
     try:
-        return jsonify(helium_cloud.read_state())
-    except Exception as e:
-        return jsonify({"error": str(e)}), 502
+        t = transport_of()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    try:
+        state = ble_bridge.bridge().read_state() if t == "ble" else helium_cloud.read_state()
+        return jsonify({"transport": t, "state": state})
+    except BaseException as e:   # SystemExit from helium.connect() isn't an Exception
+        app.logger.exception("state read failed (%s)", t)
+        return jsonify({"error": str(e) or type(e).__name__}), 502
 
 
 @app.post("/api/ac/command")
 def ac_command():
-    """Send an AC command over cloud MQTT.
+    """Send an AC command over BLE or cloud.
 
-    Body (one of):
-      {"temperature": 23}
-      {"power": true|false}
-      {"mode": "cool"|"heat"|...}
-      {"fan": "auto"|"low"|"medium"|"high"}
-      {"turbo": true|false}
+    Body: exactly one of COMMANDS' keys, e.g. {"temperature": 23},
+    {"power": true}, {"fan": "high"}, {"timer": {"minutes": 30, "on": true}}.
+    Transport via ?transport=ble|cloud or a "transport" field (default cloud).
     """
     body = request.json or {}
     try:
-        if "temperature" in body:
-            payload = helium_cloud.temperature_payload(int(body["temperature"]))
-        elif "power" in body:
-            payload = helium_cloud.power_payload(bool(body["power"]))
-        elif "mode" in body:
-            payload = helium_cloud.mode_payload(str(body["mode"]))
-        elif "fan" in body:
-            payload = helium_cloud.fan_payload(str(body["fan"]))
-        elif "turbo" in body:
-            payload = helium_cloud.turbo_payload(bool(body["turbo"]))
-        else:
-            return jsonify({"error": "no known command field"}), 400
-    except (KeyError, ValueError) as e:
+        t = transport_of(body)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+
+    field = next((k for k in COMMANDS if k in body), None)
+    if field is None:
+        return jsonify({"error": "no known command field"}), 400
+    try:
+        payload = COMMANDS[field](body[field])
+    except (KeyError, TypeError, ValueError) as e:
         return jsonify({"error": f"bad command: {e}"}), 400
 
     try:
-        helium_cloud.publish_command(payload)
-        return jsonify({"ok": True, "payload": payload})
+        if t == "ble":
+            ble_bridge.bridge().send(payload)
+        else:
+            helium_cloud.publish_command(payload)
+        return jsonify({"ok": True, "transport": t, "command": field, "payload": payload})
+    except BaseException as e:   # SystemExit from helium.connect() isn't an Exception
+        app.logger.exception("command failed (%s/%s)", t, field)
+        return jsonify({"error": str(e) or type(e).__name__, "payload": payload}), 502
+
+
+# ---- BLE link management (single central; connect lazily, hold the link) ----
+
+@app.get("/api/ble/status")
+def ble_status():
+    return jsonify(ble_bridge.status())
+
+
+@app.post("/api/ble/connect")
+def ble_connect():
+    try:
+        return jsonify(ble_bridge.bridge().connect())
+    except BaseException as e:
+        # helium.connect() raises SystemExit when the AC isn't advertising, and
+        # str(SystemExit) is "" — report the type so the error is never blank.
+        app.logger.exception("BLE connect failed")
+        return jsonify({"error": str(e) or type(e).__name__}), 502
+
+
+@app.post("/api/ble/disconnect")
+def ble_disconnect():
+    try:
+        return jsonify(ble_bridge.bridge().disconnect())
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
 
 @app.get("/")
 def index():
-    return send_from_directory(".", "index.html")
+    return send_from_directory(DIST, "index.html")
+
+
+@app.errorhandler(404)
+def spa_fallback(_e):
+    """Unknown non-API paths fall through to the SPA."""
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "not found"}), 404
+    return send_from_directory(DIST, "index.html")
 
 
 if __name__ == "__main__":
