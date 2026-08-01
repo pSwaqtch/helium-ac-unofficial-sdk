@@ -13,7 +13,8 @@ without the vendor app. Target: Python (Mac) first, then ESP32.
   set: temperature, power, fan, mode, verticalSwing, turbo, sleep, display,
   convertible, silent, horizontalSwing, timer. e2e-verified against BLE ground
   truth (§7j maps each command to the DP it moves); user confirmed audible beeps.
-  Wired into `web/server.py` (`GET /api/ac/state`, `POST /api/ac/command`). The
+  Wired into `web/server.py` (`GET /api/ac/state`, `POST /api/ac/command`), which
+  now drives BLE **and** cloud from one dual-transport web panel (§7k). The
   one non-obvious gotcha: publish RAW bytes at QoS 0, not the hex text (§7j).
 - Local WiFi API does **not** exist on the device (§7d); cloud round-trips Mumbai
   and is inferior to BLE for a device in the same home, but enables control from
@@ -1114,20 +1115,79 @@ retries across a few connects (default 3). Device also expects a `ping` to
 `helium_cloud.py` — connect (mutual-TLS), `read_state`, `publish_command`, and
 ALL 12 builders (temperature/power/fan/mode/verticalSwing/turbo/sleep/display/
 convertible/silent/horizontalSwing/timer). Wired into `web/server.py`:
-`GET /api/ac/state`, `POST /api/ac/command`. Deps: `paho-mqtt`, `cryptography`.
+`GET /api/ac/state`, `POST /api/ac/command` — both transport-selectable (§7k).
+`web/ble_bridge.py` puts BLE behind the same endpoints; `web/src/` is the SPA.
+Deps: `paho-mqtt`, `cryptography`.
 Frida capture artifacts under `scratchpad/` (agent, compiled bundle, attach
 runner, `e2e_test.py`) and `capture.js` (uncompiled hook source).
 
-### NEXT (not done this session): dual-transport frontend
-User is building a new frontend to drive BOTH BLE and cloud so commands can be
-tested manually. Key facts for it:
-- BLE and cloud take the **same raw 26-byte payloads** (build once).
-- BLE runs only from a machine in range (single BLE central; the phone app must
-  be disconnected from the AC for our client to connect). Cloud works anywhere.
-- `helium.py` has a `Helium` class (async/bleak): `connect/send/login/set_temp`.
-  For a server, wrap it in a persistent background asyncio loop (single central).
-- `web/server.py` currently exposes the CLOUD path only (`/api/ac/*`); BLE not yet
-  bridged into the server.
+## 7k. ✅ DONE — dual-transport frontend (BLE + cloud in one panel)
+
+Both transports are now driven from one web UI. Confirmed live: a **BLE** write of
+26°C was read back **over cloud** as `setpoint_C=26` — independent channels
+agreeing, which is the proof that the shared-payload design holds.
+
+### Backend (`web/server.py`)
+- `POST /api/ac/command` — all **12** commands via a `COMMANDS` dict of builders
+  (was a 5-branch if/elif). Timer takes `{"timer":{"minutes":30,"on":true}}`.
+- `GET /api/ac/state` and the command endpoint both take `?transport=ble|cloud`
+  (or a `transport` JSON field); default `cloud`. State replies are
+  `{"transport":…, "state":{…}}`.
+- `GET /api/ble/status`, `POST /api/ble/connect`, `POST /api/ble/disconnect`.
+- Serves the built SPA: `static_folder=web/dist`, `/` → `dist/index.html`, plus a
+  404 handler that falls through to the SPA for non-`/api/` paths.
+
+### BLE bridge (`web/ble_bridge.py`)
+One background thread owning an asyncio loop + a single `Helium` connection
+(the AC allows one central); Flask handlers cross over with
+`asyncio.run_coroutine_threadsafe`. Lazily connects, `connect()` then `login()`.
+
+Two gotchas found while wiring it up:
+- **`login()` returning False does NOT mean commands are refused.** The 0x79
+  passkey ack only re-fires on a fresh session; on a warm one `authed:false` is
+  reported yet writes land fine (verified — the 26°C write above).
+- **`helium.py` raises `SystemExit`, which `except Exception` does NOT catch.**
+  `connect()` does `raise SystemExit("AC not advertising…")` — a `BaseException`.
+  It escaped the Flask handlers entirely (generic 502, no JSON), and where it was
+  caught, `str(SystemExit(...))` is `""`, so the API returned `{"error":""}`.
+  The BLE routes now catch `BaseException` and fall back to the exception type
+  name so an error is never blank. Watch for this in any new handler.
+- **`helium.py`'s notify parser can emit garbage integers.** It trusts the
+  frame's own length field, so `int.from_bytes(b[10:10+dlen])` over-reads when a
+  frame carries trailing bytes — observed `fan = 13002342400` while a
+  simultaneous cloud read reported no fan DP at all. `read_state()` in the bridge
+  drops values wider than the DP (except DP1C, a genuinely wide counter) instead
+  of reporting them. `helium.py` itself is left untouched (CLI scripts share it);
+  the root-cause fix would be bounding `dlen` against the frame length.
+
+### Frontend (`web/src/App.jsx`)
+React + Vite + Tailwind v4 (`@tailwindcss/vite`), everything bundled — no CDN
+tags. Transport toggle persisted to localStorage; power/temp ±(16–30)/mode/fan/
+both swings/turbo/sleep/display/silent up front; timer + convertible tucked into
+a collapsed "least tested" block (they move no observable DP). A always-visible
+status strip auto-reads on load, on transport change, and 1.5 s after each
+command; every action is logged with the transport used and the raw hex sent.
+
+> Cloud `read_state()` takes seconds (it retries across fresh MQTT connects);
+> BLE reads are an instant `ac.state` snapshot. Hence refresh-after-command
+> rather than interval polling.
+
+### Run it
+```
+python web/server.py                 # prod: serves web/dist on :5055
+cd web && npm run dev                # dev: :5173, proxies /api -> :5055
+curl -X POST 'localhost:5055/api/ac/command?transport=cloud' \
+     -H 'Content-Type: application/json' -d '{"power":true}'
+```
+
+### Verified this session
+```
+cloud: setpoint 25->23 (re-read confirms); all 12 payloads match the §7j table
+BLE:   setpoint ->26, cross-checked via a cloud read      CONFIRMED
+BLE:   setpoint 24->22, confirmed by BLE re-read          CONFIRMED
+prod:  npm run build -> Flask serves dist/ + hashed assets (200)
+dev:   vite :5173 proxying /api/ble/status -> Flask       CONFIRMED
+```
 
 ## 8. Open questions
 
