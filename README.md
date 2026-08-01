@@ -7,6 +7,24 @@ The protocol was recovered by reverse-engineering the vendor Android app — the
 full story, wire format and datapoint map live in [`PROTOCOL.md`](PROTOCOL.md).
 This file is just how to run it.
 
+> **Unofficial.** Not affiliated with, endorsed by, or supported by Helium Air
+> ([heliumair.in](https://heliumair.in/)). "Helium" is their name, not ours. This
+> is an independent client for hardware I own, built from clean-room analysis of
+> their public app.
+
+### Why this exists
+
+The official Helium app is unpleasant enough to route around. The specific
+problem that motivated this: **sessions drop constantly** — you get silently
+logged out and have to re-authenticate by SMS OTP before you can change the
+temperature, which is a genuinely bad thing to discover at 2am in an Indian
+summer. Beyond that it's slow, needs an internet round-trip to Mumbai to talk to
+a unit in the same room, and has no automation surface at all.
+
+This panel fixes those directly: no login required for BLE, no cloud dependency,
+no session to lose, and a plain HTTP API you can script. The AC is decent
+hardware; the software in front of it was the problem.
+
 ```
 ┌─────────────┐   /api    ┌──────────────┐   MQTT/TLS   ┌─────────┐
 │ React panel │ ────────► │ Flask server │ ───────────► │ AWS IoT │──┐
@@ -155,7 +173,17 @@ These are real and documented in `PROTOCOL.md` §7j–7k — not things to re-de
 | `ble/`, `frida/` | Reverse-engineering scripts — scanning, captures, app hooks |
 | `PROTOCOL.md` | Full protocol, datapoint map, and how it was derived |
 
-## Safety
+## Safety & scope
 
 This talks to a real appliance over its vendor cloud and to hardware in your home.
-Credentials (`*.p12`, `*.pem`, `apk/assets/`) are gitignored — keep them that way.
+Credentials (`*.p12`, `*.pem`, `apk/assets/`) are gitignored — keep them that way,
+and configure your own unit via `.env` (see [Configure](#configure)).
+
+Intended for **hardware you own**. It authenticates as your own account against
+your own device; it isn't a way to reach anyone else's AC, and the BLE path needs
+physical radio range. The vendor's own credentials extracted from their APK are
+deliberately **not** redistributed here — you supply them from your own install.
+
+Interoperating with a device you bought is broadly legal in most jurisdictions,
+but this is published as-is with no warranty, and the vendor may change their
+protocol at any time.
