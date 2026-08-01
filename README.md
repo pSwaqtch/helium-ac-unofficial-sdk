@@ -3,6 +3,16 @@
 Control a Helium air conditioner from your own machine over **BLE** or **AWS IoT
 cloud MQTT**, with no vendor app. Both transports are driven from one web panel.
 
+<p align="center">
+  <img src="assets/ui-desktop-light.png" width="49%" alt="Desktop Panel Light Mode" />
+  <img src="assets/ui-desktop-dark.png" width="49%" alt="Desktop Panel Dark Mode" />
+</p>
+
+<p align="center">
+  <img src="assets/ui-mobile-light.png" width="40%" alt="Mobile Panel Light Mode" />
+  <img src="assets/ui-mobile-dark.png" width="40%" alt="Mobile Panel Dark Mode" />
+</p>
+
 The protocol was recovered by reverse-engineering the vendor Android app — the
 full story, wire format and datapoint map live in [`PROTOCOL.md`](PROTOCOL.md).
 This file is just how to run it.
@@ -159,6 +169,12 @@ These are real and documented in `PROTOCOL.md` §7j–7k — not things to re-de
 - **`sleep` / `display` / `silent` / `horizontalSwing` don't echo a distinct
   datapoint** either — they're accepted (audible beep) but won't change the readout.
   The panel shows them as permanently *unknown* rather than pretending they're off.
+- **The airflow toggles act inverted.** Sending *on* leaves the unit *off*, and
+  vice versa. Confirmed for vertical swing and turbo by e2e capture, and for
+  sleep, display and silent by watching the unit directly. Only horizontal swing
+  is unchecked. The payload builders stay byte-identical to the vendor app, so
+  this is the device's behaviour rather than ours — see PROTOCOL §7l for why it
+  isn't "corrected" in code.
 
 ## Layout
 
