@@ -53,3 +53,6 @@ captures/*.flows
 
 # Working scratch prompt, not published docs
 FRONTEND_PROMPT.md
+
+# Design specs — local working notes
+docs/superpowers/
