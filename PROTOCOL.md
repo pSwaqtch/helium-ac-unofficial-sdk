@@ -1160,17 +1160,49 @@ Two gotchas found while wiring it up:
   of reporting them. `helium.py` itself is left untouched (CLI scripts share it);
   the root-cause fix would be bounding `dlen` against the frame length.
 
-### Frontend (`web/src/App.jsx`)
+### Frontend (`web/src/`)
 React + Vite + Tailwind v4 (`@tailwindcss/vite`), everything bundled — no CDN
 tags. Transport toggle persisted to localStorage; power/temp ±(16–30)/mode/fan/
 both swings/turbo/sleep/display/silent up front; timer + convertible tucked into
-a collapsed "least tested" block (they move no observable DP). A always-visible
-status strip auto-reads on load, on transport change, and 1.5 s after each
-command; every action is logged with the transport used and the raw hex sent.
+a collapsed "least tested" block (they move no observable DP). Auto-reads on
+load, on transport change, and 1.5 s after each command; every action is logged
+with the transport used and the raw hex sent.
 
 > Cloud `read_state()` takes seconds (it retries across fresh MQTT connects);
 > BLE reads are an instant `ac.state` snapshot. Hence refresh-after-command
 > rather than interval polling.
+
+**Explicit-state rule.** Every control renders one of three visually distinct
+states — **on**, **off**, or **unknown** — and no value is displayed unless the AC
+reported it. This matters because the two transports report different DP sets:
+
+| Reported by | DPs |
+|---|---|
+| both | `setpoint_C`, `room_temp_C`, `power_W` |
+| BLE only | `power`, `mode`, `fan`, `turbo`, `vertical_swing` |
+| neither | `horizontalSwing`, `sleep`, `display`, `silent` |
+
+So on **cloud** transport power/mode/fan/turbo/vertical-swing legitimately read
+*unknown*, while **BLE** shows real values; the four in the last row are unknown
+permanently, and stay unknown even after a command, since nothing ever confirms
+them. Unknown is dashed and carries the word — it must never be confusable with a
+settled *off*. Known toggles flip; unknown ones expose explicit On/Off buttons,
+because with no position to flip from a single toggle could only send one command.
+
+Two consequences worth knowing: the setpoint initialises to `null` (not 24), so
+the readout shows `—` and the ± buttons stay disabled until a read lands; and an
+unrecognised `mode` value reads as unknown rather than being labelled "heat" by
+an else branch. Timer/convertible keep numeric prefills — they are command
+arguments, not device state, so the rule doesn't reach them.
+
+Components: `App.jsx` (routing, transport), `useAcState.js` (reads, commands,
+log), `api.js`, and `components/` — `Hero`, `Segmented`, `Switch`, `TransportBar`,
+`ActivityLog`, `Advanced`, `Auth`, `DeviceList`. Responsive single→two column,
+44 px minimum touch targets.
+
+**Cloud sign-in** (`Auth.jsx`): phone → `/api/send-otp` → `/api/verify-otp`, then
+the device list from `/api/devices` + `/api/hoags-devices`. Reachable from the
+header but never required — BLE works signed out.
 
 ### Run it
 ```

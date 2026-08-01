@@ -60,6 +60,31 @@ the toggle to BLE, press **Connect**, then use it normally. Reads are instant.
 
 Every action shows which transport it used and the raw hex sent.
 
+### Reading the controls
+
+The panel never guesses. Every control shows one of three states — **on**, **off**,
+or **unknown** — and displays a value only if the AC actually reported it. Unknown
+is dashed and says so, and is never styled like a settled *off*.
+
+This means the panel knows less over cloud than over BLE, by design:
+
+| | reports |
+|---|---|
+| both transports | setpoint, room temp, power draw |
+| BLE only | power, mode, fan, turbo, vertical swing |
+| neither | horizontal swing, sleep, display, silent |
+
+So on cloud, mode/fan/power read *unknown* — that's the device not answering, not a
+bug. The bottom row is unknown permanently and stays unknown even after you press
+it, because nothing ever confirms those. They're still sendable: unknown controls
+give you explicit On/Off buttons rather than a toggle.
+
+Likewise the setpoint reads `—` with the ± buttons disabled until a state read
+lands, rather than starting from an invented number.
+
+**Sign-in** (header, top right) is only for the cloud account and device list —
+BLE needs no account.
+
 ## HTTP API
 
 ```bash
@@ -99,6 +124,7 @@ These are real and documented in `PROTOCOL.md` §7j–7k — not things to re-de
   receipt, which is the only confirmation available.
 - **`sleep` / `display` / `silent` / `horizontalSwing` don't echo a distinct
   datapoint** either — they're accepted (audible beep) but won't change the readout.
+  The panel shows them as permanently *unknown* rather than pretending they're off.
 
 ## Layout
 
@@ -108,7 +134,7 @@ These are real and documented in `PROTOCOL.md` §7j–7k — not things to re-de
 | `helium.py` | BLE client (async/bleak): `connect`, `login`, `send` |
 | `web/server.py` | Flask — API for both transports, serves the built SPA |
 | `web/ble_bridge.py` | BLE on a background asyncio loop, exposed to sync Flask handlers |
-| `web/src/App.jsx` | The control panel (React + Vite + Tailwind) |
+| `web/src/` | The control panel — `App.jsx`, `useAcState.js`, `components/` (React + Vite + Tailwind) |
 | `ble/`, `frida/` | Reverse-engineering scripts — scanning, captures, app hooks |
 | `PROTOCOL.md` | Full protocol, datapoint map, and how it was derived |
 
