@@ -11,6 +11,9 @@ web/node_modules/
 # macOS
 .DS_Store
 
+# Local config — real device values
+.env
+
 # Secrets / credentials (AWS IoT, TLS)
 *.p12
 *.pem
@@ -47,3 +50,6 @@ FS/
 # Runtime logs & captures
 *.log
 captures/*.flows
+
+# Working scratch prompt, not published docs
+FRONTEND_PROMPT.md

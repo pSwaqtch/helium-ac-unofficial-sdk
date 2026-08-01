@@ -3,6 +3,11 @@
 Reverse-engineering notes for controlling a Helium air conditioner over BLE
 without the vendor app. Target: Python (Mac) first, then ESP32.
 
+> Captures below are from a real unit with account- and device-specific values
+> replaced by placeholders: `<your-device-macid>`, `<your-hoags-user-uuid>`,
+> `HELM__XXXX`, `+91XXXXXXXXXX`. Substitute your own — the code reads them from
+> `.env` (see `.env.example`), so nothing device-specific is hardcoded.
+
 **Status:**
 - **BLE temperature control: SOLVED & working** (`helium.py`). Read/notify + write
   confirmed on a live unit. See §5g for the wire format. This meets the original

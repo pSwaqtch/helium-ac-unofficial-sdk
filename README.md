@@ -25,6 +25,22 @@ by transport.
 - `apk/assets/AWSiOT.p12` + `AmazonRootCA1.pem` for the cloud path (gitignored)
 - For BLE: a Mac in range of the unit
 
+## Configure
+
+Everything device-specific lives in `.env` (gitignored). Copy the template and
+fill in your unit:
+
+```bash
+cp .env.example .env
+$EDITOR .env          # set HELIUM_DEVICE_MAC
+```
+
+Only `HELIUM_DEVICE_MAC` is required — it addresses your specific AC. Find it in
+the hoags device list `macid` field, or from a BLE scan (`python ble/scan.py`).
+Everything else (MQTT host, topics, BLE passkey, p12 password) is a vendor
+constant already defaulted correctly in `config.py`; override via `.env` only if
+yours differs. Real environment variables win over `.env`.
+
 ## Run it
 
 **Production** — one server, serves the built UI and the API:
@@ -130,6 +146,7 @@ These are real and documented in `PROTOCOL.md` §7j–7k — not things to re-de
 
 | Path | What |
 |---|---|
+| `config.py` | Deployment config from `.env` — device MAC, endpoints, vendor constants |
 | `helium_cloud.py` | Cloud MQTT: connect, `read_state`, `publish_command`, all 12 payload builders |
 | `helium.py` | BLE client (async/bleak): `connect`, `login`, `send` |
 | `web/server.py` | Flask — API for both transports, serves the built SPA |

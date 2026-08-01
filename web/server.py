@@ -12,20 +12,22 @@ Endpoints reproduced (verified live):
   GET  /devices          Bearer -> [device]
   GET  /devices/{id}/status  Bearer -> status   (path guessed from LOG_STATUS route)
 
-Command sending (MQTT over AWS IoT) is NOT wired up yet — the p12 password and
-cloud payload schema still need a traffic capture. See PROTOCOL.md §7e.
+Command sending works over both transports (cloud MQTT and BLE) — see §7j/§7k.
+Endpoints and device identity come from `config` (a `.env` file); see
+`.env.example`.
 """
 from flask import Flask, request, jsonify, send_from_directory
 import requests, os, sys
 
 # cloud MQTT control (mutual-TLS to AWS IoT); lives one dir up
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config
 import helium_cloud
 import ble_bridge
 
-API = "https://o7sbv8y912.execute-api.ap-south-1.amazonaws.com/dev"
+API = config.API_BASE
 # the 'hoags' backend (different service) — where cloud devices actually live
-HOAGS = "https://tz1z01inlb.execute-api.ap-south-1.amazonaws.com/hoags"
+HOAGS = config.HOAGS_BASE
 # the built SPA (vite `npm run build` in web/); assets are hashed under dist/assets
 DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist")
 app = Flask(__name__, static_folder=DIST, static_url_path="")

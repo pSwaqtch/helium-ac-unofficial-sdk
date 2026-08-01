@@ -22,15 +22,16 @@ is written to b002 (the app base64s it only because react-native-ble-plx require
 base64 for the transport).
 
 The MCU ignores all AC_CTRL commands until the session is authenticated with the
-4-digit passkey (this unit: 1111; factory-fresh units use 0000).
+4-digit passkey (factory-fresh units use 0000; see HELIUM_BLE_PASSKEY in .env).
 """
 import asyncio, sys, re
+import config
 from bleak import BleakScanner, BleakClient
 
 B002 = "0000b002-0000-1000-8000-00805f9b34fb"
 B003 = "0000b003-0000-1000-8000-00805f9b34fb"
 
-PASSKEY = "1111"
+PASSKEY = config.BLE_PASSKEY
 
 CMD_BLE_PASSKEY   = 600
 CMD_AC_CTRL       = 1003
@@ -75,7 +76,8 @@ def p_passkey(pk): return packet(CMD_BLE_PASSKEY, pk.encode("utf-8"), total_leve
 
 
 class Helium:
-    def __init__(self, name_match="7f93"):
+    def __init__(self, name_match=None):
+        name_match = name_match or config.BLE_NAME_MATCH
         self.name_match = name_match
         self.client = None
         self.state = {}

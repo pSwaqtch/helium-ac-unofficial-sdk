@@ -3,19 +3,18 @@
 Helium AC — cloud (AWS IoT MQTT) control.
 
 Reproduces the vendor app's HeliumCloudMQTTModule: mutual-TLS to AWS IoT with the
-shipped client cert (AWSiOT.p12, password "1234" — captured at runtime via Frida)
-and publishes the same buildPacket hex payload the app sends.
+shipped client cert (AWSiOT.p12 — password captured at runtime via Frida) and
+publishes the same buildPacket hex payload the app sends.
 
 Payload is byte-identical to the BLE temperature frame (PROTOCOL §5g/§7g):
   25-byte header (cmdId=1003 AC_CTRL, seq=1, total_level=2, level=02 00 00 00 00,
   totalSize=1) + 1-byte celsius, rendered as lowercase hex text.
 
-Verified inputs (see memory: helium-cloud-mqtt-secrets):
-  host  = a198fgj6igmrrt-ats.iot.ap-south-1.amazonaws.com : 8883
-  topic = hoags/Helium/ac/HELM0000015HMKP1/<your-device-macid>/hoagsUIControl
-  ack   = .../hoagsUIControlAck
+Host, topics, credentials and the device MAC all come from `config` (a `.env`
+file); see `.env.example`.
 """
 import os, ssl, time, tempfile, struct, warnings
+import config
 import paho.mqtt.client as mqtt
 from cryptography.hazmat.primitives.serialization import pkcs12, Encoding, PrivateFormat, NoEncryption
 
@@ -23,16 +22,16 @@ from cryptography.hazmat.primitives.serialization import pkcs12, Encoding, Priva
 warnings.filterwarnings("ignore", message="PKCS#12 bundle could not be parsed as DER")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-P12_PATH = os.path.join(HERE, "apk/assets/AWSiOT.p12")
-CA_PATH  = os.path.join(HERE, "apk/assets/AmazonRootCA1.pem")
-P12_PASSWORD = b"1234"
+P12_PATH = config.P12_PATH
+CA_PATH  = config.CA_PATH
+P12_PASSWORD = config.P12_PASSWORD
 
-HOST = "a198fgj6igmrrt-ats.iot.ap-south-1.amazonaws.com"
-PORT = 8883
-MAC  = "<your-device-macid>"
-BASE_TOPIC = f"hoags/Helium/ac/HELM0000015HMKP1/{MAC}"
-PUB_TOPIC  = f"{BASE_TOPIC}/hoagsUIControl"
-ACK_TOPIC  = f"{BASE_TOPIC}/hoagsUIControlAck"
+HOST = config.MQTT_HOST
+PORT = config.MQTT_PORT
+MAC  = config.DEVICE_MAC
+BASE_TOPIC = config.BASE_TOPIC
+PUB_TOPIC  = config.PUB_TOPIC
+ACK_TOPIC  = config.ACK_TOPIC
 
 
 def _client_id():
