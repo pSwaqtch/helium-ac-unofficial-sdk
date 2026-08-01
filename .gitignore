@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
+
+# Secrets / credentials (AWS IoT, TLS)
+*.p12
+*.pem
+apk/assets/
+
+# Large binaries — reverse-engineering inputs, not source
+bugreport.zip
+bundle_decomp.js
+*.apk
+*.idsig
+*.dex
+apk/bundle.strings
+
+# Capture inputs (pcaps, mitm CA)
+*.pcap
+*.crt
+
+# Local harness state
+.claude/
+
+# Decompile / patch trees (regenerable from the APK)
+jadx_out/
+jadx_main/
+jadx_pairip/
+jadx_pairip2/
+pairip_patch/
+gadget_extract/
+gadget_inject/
+scratch_manifest/
+surgical/
+surgical2/
+FS/
+
+# Runtime logs & captures
+*.log
+captures/*.flows
