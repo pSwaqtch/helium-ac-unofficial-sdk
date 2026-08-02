@@ -50,8 +50,39 @@ and link "Sinric Pro" in the Google Home app.
 * Power/setpoint *displayed* state reflects the last command the bridge sent, not a
   live read — the device's cloud state dump is intermittent by design (see main README).
 * Relative temperature ("make it cooler") isn't wired; use absolute ("set AC to 23").
-* Fan / swing / turbo aren't exposed (a thermostat device has no slot for them) —
-  they stay in the web panel and HTTP API.
+* Fan / swing / turbo aren't exposed yet — see below.
+
+### Future: more controls
+
+The Thermostat device covers power, setpoint and cool/heat mode. The AC's other
+capabilities can be added too. The clean way in Google Home is **one extra
+SinricPro device per control** (Google's voice handling for a device's custom
+sub-controls is unreliable; separate devices "just work"). Each new device is
+created in the SinricPro portal, its Device Id added to `.env`, and wired into
+`bridge/sinricpro_bridge.py`.
+
+| Add as SinricPro… | Voice | Helium command | Notes on cloud |
+|---|---|---|---|
+| **Fan** ("AC Fan") | "set AC Fan to high/medium/low" | `fan` (auto/low/med/high) | Sends fine; reads back "unknown" over cloud |
+| **Switch** "AC Turbo" | "turn on AC turbo" | `turbo` | ⚠️ unit acts **inverted**, no state echo |
+| **Switch** "AC Swing" | "turn on AC swing" | `verticalSwing` | ⚠️ inverted, no echo |
+| **Switch** "AC Sleep" | "turn on AC sleep" | `sleep` | fire-and-forget, no echo |
+| **Switch** "AC Display" | "turn on AC display" | `display` | fire-and-forget, no echo |
+| Switch "AC Silent" / "AC H-Swing" | … | `silent` / `horizontalSwing` | least-tested |
+
+Two caveats, both inherent to the hardware (not the bridge), documented in the
+main README and `PROTOCOL.md §7l`:
+
+* **The airflow toggles are inverted** — the unit acts on a byte-identical payload
+  backwards (confirmed for turbo and vertical swing). "Turn on turbo" may leave it
+  off. The bridge could invert them to compensate, but that's per-toggle guesswork
+  without watching the unit.
+* **No state feedback over cloud** for these — Google shows the last command sent,
+  since the AC only echoes setpoint and room temp reliably on cloud.
+
+Best next addition is the **Fan** device: genuinely useful and it behaves normally.
+The on/off toggles work but are the flaky/inverted ones — add them only if wanted.
+(All of these remain available meanwhile via the web panel and HTTP API.)
 
 ---
 
