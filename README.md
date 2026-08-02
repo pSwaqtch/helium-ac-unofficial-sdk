@@ -176,6 +176,29 @@ These are real and documented in `PROTOCOL.md` §7j–7k — not things to re-de
   this is the device's behaviour rather than ours — see PROTOCOL §7l for why it
   isn't "corrected" in code.
 
+## Google Assistant ("Hey Google, turn on AC")
+
+Voice control, with no Nabu Casa fee, no Home Assistant, and **no inbound port**
+opened. A small bridge (`bridge/`) holds an outbound websocket to
+[SinricPro](https://sinric.pro) — which provides the free Google Home / Alexa
+integration — and translates each command into this project's cloud MQTT payloads:
+
+```
+"Hey Google, turn on AC" → Google Home → SinricPro → bridge → AWS IoT → Helium AC
+```
+
+The AC shows up as a native thermostat: on/off, setpoint, cool/heat mode, and live
+indoor temperature ("set AC to 24", "set AC to cool").
+
+<p align="center">
+  <img src="assets/google-home-helium-ac.png" width="32%" alt="Helium AC in Google Home" />
+  <img src="assets/sinric-pro-helium-ac.png" width="32%" alt="Helium AC in the SinricPro app" />
+</p>
+
+Setup is in **[`bridge/README.md`](bridge/README.md)**; the design and the
+Home Assistant alternative are in
+[`docs/google-home-integration.md`](docs/google-home-integration.md).
+
 ## Layout
 
 | Path | What |
