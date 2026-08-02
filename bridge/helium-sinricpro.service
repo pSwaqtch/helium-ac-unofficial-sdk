@@ -1,0 +1,27 @@
+# User service — runs in your (unconfined) user session, so SELinux allows
+# executing the venv/python that live under /home. Install as a *user* unit:
+#   mkdir -p ~/.config/systemd/user
+#   cp bridge/helium-sinricpro.service ~/.config/systemd/user/
+#   loginctl enable-linger "$USER"          # start at boot without login
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now helium-sinricpro
+# Logs:  journalctl --user -u helium-sinricpro -f
+#        (or, always works:  sudo journalctl _SYSTEMD_USER_UNIT=helium-sinricpro.service -f)
+#
+# (Do NOT install this under /etc/systemd/system — a system unit runs as init_t
+#  and SELinux blocks executing binaries under /home: status=203/EXEC.)
+[Unit]
+Description=Helium AC <-> SinricPro bridge (Google Assistant control)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/opc/projects/helium-ac-unofficial-sdk
+ExecStart=/home/opc/projects/helium-ac-unofficial-sdk/.venv/bin/python bridge/sinricpro_bridge.py
+Restart=on-failure
+RestartSec=5
+# outbound-only websocket; no ports to open
+
+[Install]
+WantedBy=default.target
