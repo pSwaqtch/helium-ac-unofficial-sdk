@@ -227,3 +227,8 @@ deliberately **not** redistributed here — you supply them from your own instal
 Interoperating with a device you bought is broadly legal in most jurisdictions,
 but this is published as-is with no warranty, and the vendor may change their
 protocol at any time.
+
+## License
+
+[MIT](LICENSE) © 2026 Krupal Virani. "Helium" is the vendor's name — this project
+is unofficial and unaffiliated (see the note at the top).
