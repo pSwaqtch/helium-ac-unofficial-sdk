@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""
+SinricPro → Helium AC bridge.
+
+Lets Google Assistant control the AC ("Hey Google, turn on AC") without Nabu Casa,
+Home Assistant, or exposing any inbound port. SinricPro publishes a free Google
+Home (and Alexa) integration; this process holds an *outbound* websocket to their
+cloud, receives the voice-triggered commands, and translates them into the same
+cloud MQTT payloads the rest of this project sends.
+
+    "Hey Google…" → Google Home → SinricPro cloud → (this bridge) → AWS IoT → AC
+
+Only the `cloud` transport is used — this box has no Bluetooth radio near the unit.
+
+Setup and running: see bridge/README.md. Credentials come from `.env` (see
+`.env.example`): SINRICPRO_APP_KEY, SINRICPRO_APP_SECRET, SINRICPRO_AC_DEVICE_ID.
+"""
+import os
+import sys
+import queue
+import asyncio
+import logging
+import threading
+
+# import the project modules from the repo root (one dir up); `config` loads .env
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import config  # noqa: E402  (side effect: populates os.environ from .env)
+import helium_cloud as h  # noqa: E402
+
+from sinric import SinricPro, SinricProConstants  # noqa: E402
+
+log = logging.getLogger("helium-sinric")
+
+APP_KEY = os.environ.get("SINRICPRO_APP_KEY", "")
+APP_SECRET = os.environ.get("SINRICPRO_APP_SECRET", "")
+DEVICE_ID = os.environ.get("SINRICPRO_AC_DEVICE_ID", "")
+
+TEMP_MIN, TEMP_MAX = 16, 30          # unit's accepted setpoint range (README)
+DEFAULT_MODE = "cool"                # what AUTO / a bare power-on maps to
+
+# last values we told the AC, so we can echo sensible state back to Google
+_state = {"power": "Off", "setpoint": 24, "mode": DEFAULT_MODE}
+
+
+# ---------------------------------------------------------------------------
+# Helium I/O runs on ONE dedicated thread that owns the MQTT client, so the
+# asyncio event loop is never blocked by a (re)connect and MQTT access is
+# serialized. Commands are QoS-0 fire-and-forget — the device sends no reliable
+# ack — so callbacks enqueue and report success optimistically.
+# ---------------------------------------------------------------------------
+_q: "queue.Queue[str]" = queue.Queue()
+
+
+def _worker():
+    cli = None
+    while True:
+        payload = _q.get()
+        for attempt in (1, 2):
+            try:
+                if cli is None:
+                    log.info("connecting to AWS IoT…")
+                    cli = h.connect(timeout=20)
+                h.publish_command(payload, cli=cli)
+                break
+            except Exception as e:  # noqa: BLE001 — reconnect on any failure
+                log.warning("publish failed (attempt %d/2): %s", attempt, e)
+                try:
+                    if cli:
+                        cli.loop_stop()
+                        cli.disconnect()
+                except Exception:
+                    pass
+                cli = None
+        else:
+            log.error("gave up on payload %s", payload)
+
+
+def send(payload: str):
+    """Queue one already-built hex payload for delivery to the AC."""
+    _q.put(payload)
+
+
+def _clamp_temp(t) -> int:
+    return max(TEMP_MIN, min(TEMP_MAX, int(round(float(t)))))
+
+
+# ---------------------------------------------------------------------------
+# SinricPro request callbacks. Each is a *plain* function returning (True, value)
+# — the SDK calls it synchronously and expects that tuple (see _power_controller
+# / _temperature_controller / _thermostat_controller in the sinricpro package).
+# ---------------------------------------------------------------------------
+def on_power_state(device_id, state):
+    """state is "On" / "Off"."""
+    on = (state == SinricProConstants.POWER_STATE_ON)
+    log.info("power -> %s", state)
+    send(h.power_payload(on))
+    _state["power"] = state
+    return True, state
+
+
+def on_target_temperature(device_id, temperature):
+    """Absolute setpoint, e.g. "set AC to 24"."""
+    t = _clamp_temp(temperature)
+    log.info("setpoint -> %d C", t)
+    send(h.temperature_payload(t))
+    _state["setpoint"] = t
+    return True, t
+
+
+def on_set_thermostat_mode(device_id, mode):
+    """mode is COOL / HEAT / AUTO / OFF (Google's thermostat modes)."""
+    mode = (mode or "").upper()
+    log.info("mode -> %s", mode)
+    if mode == SinricProConstants.THERMOSTAT_MODE_OFF:
+        send(h.power_payload(False))
+        _state["power"] = "Off"
+        return True, mode
+    # COOL / HEAT / AUTO → make sure it's on, then set the operating mode
+    hmode = "heat" if mode == SinricProConstants.THERMOSTAT_MODE_HEAT else "cool"
+    send(h.power_payload(True))
+    send(h.mode_payload(hmode))
+    _state["power"] = "On"
+    _state["mode"] = hmode
+    return True, mode
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    missing = [n for n, v in (
+        ("SINRICPRO_APP_KEY", APP_KEY),
+        ("SINRICPRO_APP_SECRET", APP_SECRET),
+        ("SINRICPRO_AC_DEVICE_ID", DEVICE_ID),
+    ) if not v]
+    if missing:
+        raise SystemExit(
+            "Missing SinricPro settings: " + ", ".join(missing) + "\n"
+            "Add them to .env (see .env.example) — create the device at "
+            "https://sinric.pro. Details in bridge/README.md."
+        )
+
+    # start the MQTT worker before we accept any commands
+    threading.Thread(target=_worker, name="helium-mqtt", daemon=True).start()
+
+    callbacks = {
+        SinricProConstants.SET_POWER_STATE: on_power_state,
+        SinricProConstants.TARGET_TEMPERATURE: on_target_temperature,
+        SinricProConstants.SET_THERMOSTAT_MODE: on_set_thermostat_mode,
+    }
+
+    client = SinricPro(
+        APP_KEY, [DEVICE_ID], callbacks,
+        enable_log=False, restore_states=False, secret_key=APP_SECRET,
+    )
+    log.info("bridge up — device %s; waiting for Google/SinricPro commands", DEVICE_ID)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(client.connect())
+    except KeyboardInterrupt:
+        log.info("shutting down")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,87 +1,122 @@
-# Google Assistant & Home Assistant Integration
+# Google Assistant integration
 
-This guide outlines the best architectural approaches for integrating the Helium AC unofficial SDK with Google Assistant (Google Home / Gemini) using Home Assistant as the translation layer.
+Goal: **"Hey Google, turn on AC"** (and set temperature / mode) controls the unit.
 
-## Why Home Assistant?
+There's a native Google Smart Home path (build your own OAuth2 server + SYNC/QUERY/
+EXECUTE intent handling) but that's a large effort for one AC. The two practical
+routes below both avoid it.
 
-Building a native "Google Smart Home Action" from scratch requires setting up an OAuth2 server and handling complex Google JSON intents (SYNC, QUERY, EXECUTE). It's a massive development effort for a single air conditioner. 
+| Route | Cost | Inbound ports | Needs Home Assistant | Best for |
+|---|---|---|---|---|
+| **SinricPro bridge** | Free (≤3 devices) | **None** (outbound ws) | No | This VPS deployment — recommended |
+| Home Assistant | Free\* | Yes, or Nabu Casa (~$6.50/mo) | Yes | If you already run HA / want a dashboard |
 
-**Home Assistant** acts as the perfect middleman. It can easily communicate with the Helium API using simple REST commands and has built-in, native bridging to Google Assistant.
-
----
-
-## 1. The Absolute Best Way: Local Hardware (Recommended)
-
-The most reliable, lowest-latency, and future-proof setup involves running Home Assistant on a physical device (like a Raspberry Pi or an old laptop) in the same room as your AC.
-
-### Why this is the best:
-* **Immunity to the Cloud:** The vendor's cloud app is notoriously unreliable. If you use the `cloud` transport, you still rely on Helium's AWS servers. If the company shuts down their servers or changes authentication, your setup breaks.
-* **100% Local Reliability:** By using the local `ble` (Bluetooth) transport, commands go directly from your local server to the AC through the air. It works instantly and forever, even if your internet goes down.
-* **Easy Google Integration:** You can use **Nabu Casa** (Home Assistant Cloud) for a 1-click integration with Google Assistant, without exposing any local network ports to the public internet.
+\* Free HA→Google needs a Google Cloud project + your own HTTPS endpoint; Nabu Casa
+removes that for a subscription.
 
 ---
 
-## 2. The "Zero Hardware" Way: Cloud Server (Oracle VPC)
+## Recommended: SinricPro bridge
 
-If you absolutely do not want to buy or maintain a physical server in your house, you can host both this SDK and Home Assistant on a free cloud instance (like an Oracle VPC).
+SinricPro publishes a free, maintained Google Home (and Alexa) integration. A small
+bridge process holds an **outbound** websocket to their cloud, receives the voice
+commands, and sends this project's `cloud` (AWS IoT MQTT) payloads to the AC.
 
-### How it works:
-1. You run this project's API on the Oracle VPS using the `cloud` transport.
-2. You run **Home Assistant** (e.g., via Docker) on that exact same Oracle VPS.
-3. Home Assistant talks to the Helium API over `localhost`.
-4. You link your cloud-hosted Home Assistant to Google Home.
+```
+"Hey Google…" → Google Home → SinricPro cloud → bridge → AWS IoT → AC
+```
 
-### Pros & Cons:
-* **Pros:** $0 upfront cost, no hardware at home.
-* **Cons:** You are dependent on Helium's AWS cloud staying online. If the cloud API changes or goes down, you lose control of the AC.
+Why this is the fit for the cloud/VPS deployment:
+
+* **No inbound exposure.** The bridge only dials out, so no firewall/security-list
+  changes and nothing new reachable from the internet.
+* **No extra services.** No Home Assistant, no reverse proxy, no OAuth server.
+* **Native device in Google Home.** Shows up as a real thermostat, so on/off,
+  setpoint and mode "just work" by voice.
+
+Only the `cloud` transport is used — a cloud host has no Bluetooth radio near the
+unit. That does mean you depend on Helium's AWS IoT staying up (same caveat as any
+cloud control).
+
+**Setup and running: [`bridge/README.md`](../bridge/README.md).** In short: create a
+free `Thermostat` device at <https://sinric.pro>, put its App Key / App Secret /
+Device Id in `.env`, run `bridge/sinricpro_bridge.py` as a user systemd service,
+and link "Sinric Pro" in the Google Home app.
+
+### Limits
+
+* Google's *displayed* state reflects the last command the bridge sent, not a live
+  read — the device's cloud state dump is intermittent by design (see main README).
+* Relative temperature ("make it cooler") isn't wired; use absolute ("set AC to 23").
+* Fan / swing / turbo aren't exposed (a thermostat device has no slot for them) —
+  they stay in the web panel and HTTP API.
 
 ---
 
-## Home Assistant Configuration Example
+## Alternative: Home Assistant
 
-Regardless of whether you host locally or on a VPC, here is the YAML configuration you need to add to your Home Assistant `configuration.yaml` file to link it to the Helium API.
+Use this if you already run Home Assistant or want its dashboard/automations. HA
+talks to the Helium API (`web/server.py`, default port **5055**) over REST and has
+built-in Google Assistant bridging (Nabu Casa for one-click, or the free manual
+[Google Assistant integration](https://www.home-assistant.io/integrations/google_assistant/)).
 
-Assuming your Helium API is running at `192.168.1.100:5055` (replace with `localhost:5055` if hosted on the same machine):
+On the same-VPS "zero hardware" setup, run HA (e.g. in Docker) alongside this
+project and point it at `http://localhost:5055`. On the VPS use `transport=cloud`
+(no Bluetooth); a local HA on hardware in range can use `transport=ble`.
 
-### 1. REST Commands (Sending Actions)
+> **These snippets are corrected against the real API.** Two things the API does
+> that a first guess gets wrong:
+> 1. **Booleans, not strings.** `POST /api/ac/command` runs `bool(value)`. In
+>    Python `bool("off")` is `True`, so `{"power":"off"}` would turn it **on**.
+>    Send JSON `true` / `false`.
+> 2. **State is nested and uses raw DP names.** `GET /api/ac/state` returns
+>    `{"transport":…, "state":{"power":1, "setpoint_C":24, "room_temp_C":27,
+>    "power_W":850}}` — not `temperature`/`room`/`mode` at the top level. Over
+>    `cloud`, `power`/`mode`/`fan` are often absent (device doesn't answer);
+>    `setpoint_C` and `room_temp_C` are the reliable ones.
+
+### REST commands (actions)
+
 ```yaml
 rest_command:
   helium_ac_power_on:
-    url: "http://192.168.1.100:5055/api/ac/command?transport=cloud" # or ?transport=ble
+    url: "http://localhost:5055/api/ac/command?transport=cloud"
     method: POST
-    headers:
-      content-type: "application/json"
-    payload: '{"power": "on"}'
+    headers: { content-type: "application/json" }
+    payload: '{"power": true}'
 
   helium_ac_power_off:
-    url: "http://192.168.1.100:5055/api/ac/command?transport=cloud"
+    url: "http://localhost:5055/api/ac/command?transport=cloud"
     method: POST
-    headers:
-      content-type: "application/json"
-    payload: '{"power": "off"}'
-    
+    headers: { content-type: "application/json" }
+    payload: '{"power": false}'
+
   helium_ac_set_temp:
-    url: "http://192.168.1.100:5055/api/ac/command?transport=cloud"
+    url: "http://localhost:5055/api/ac/command?transport=cloud"
     method: POST
-    headers:
-      content-type: "application/json"
-    payload: '{"temperature": {{ temperature }}}'
+    headers: { content-type: "application/json" }
+    payload: '{"temperature": {{ temperature }}}'   # 16–30
 ```
 
-### 2. REST Sensor (Reading State)
+### REST sensor (state)
+
 ```yaml
 sensor:
   - platform: rest
-    name: "Helium AC State"
-    resource: "http://192.168.1.100:5055/api/ac/state?transport=cloud"
-    value_template: "{{ value_json.power }}"
+    name: "Helium AC"
+    resource: "http://localhost:5055/api/ac/state?transport=cloud"
+    scan_interval: 120          # a cloud read spins up a fresh MQTT connect + retries; keep it slow
+    value_template: >
+      {{ 'on' if value_json.state.power == 1 else 'off' }}
+    json_attributes_path: "$.state"
     json_attributes:
-      - temperature
-      - room
-      - mode
+      - setpoint_C
+      - room_temp_C
+      - power_W
 ```
 
-### 3. Exposing to Google Assistant
-Once you have created scripts or a `climate` template entity using the above commands, you can expose them to Google Assistant:
-* **Easy route:** Use [Home Assistant Cloud](https://www.nabucasa.com/) (Settings -> Voice Assistants -> Google Assistant).
-* **Free route:** Follow the [Google Assistant Manual Integration guide](https://www.home-assistant.io/integrations/google_assistant/).
+### Exposing to Google
+
+Build a script or `climate` entity from the above, then either enable Nabu Casa
+(Settings → Voice Assistants → Google Assistant) or follow the free manual guide
+linked above.

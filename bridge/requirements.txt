@@ -1,0 +1,5 @@
+# Bridge deps. The cloud transport needs paho + cryptography (same as the main
+# project); sinricpro is the Google/Alexa integration client.
+paho-mqtt
+cryptography
+sinricpro

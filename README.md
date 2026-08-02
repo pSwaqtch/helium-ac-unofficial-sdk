@@ -185,6 +185,7 @@ These are real and documented in `PROTOCOL.md` §7j–7k — not things to re-de
 | `helium.py` | BLE client (async/bleak): `connect`, `login`, `send` |
 | `web/server.py` | Flask — API for both transports, serves the built SPA |
 | `web/ble_bridge.py` | BLE on a background asyncio loop, exposed to sync Flask handlers |
+| `bridge/` | SinricPro bridge for Google Assistant ("Hey Google, turn on AC") — see `bridge/README.md` and `docs/google-home-integration.md` |
 | `web/src/` | The control panel — `App.jsx`, `useAcState.js`, `components/` (React + Vite + Tailwind) |
 | `ble/`, `frida/` | Reverse-engineering scripts — scanning, captures, app hooks |
 | `PROTOCOL.md` | Full protocol, datapoint map, and how it was derived |
