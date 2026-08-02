@@ -45,8 +45,10 @@ and link "Sinric Pro" in the Google Home app.
 
 ### Limits
 
-* Google's *displayed* state reflects the last command the bridge sent, not a live
-  read — the device's cloud state dump is intermittent by design (see main README).
+* Indoor temperature **is** reported to Google (room-temp DP, refreshed periodically
+  and on every command); humidity shows 0% (the AC has no humidity sensor).
+* Power/setpoint *displayed* state reflects the last command the bridge sent, not a
+  live read — the device's cloud state dump is intermittent by design (see main README).
 * Relative temperature ("make it cooler") isn't wired; use absolute ("set AC to 23").
 * Fan / swing / turbo aren't exposed (a thermostat device has no slot for them) —
   they stay in the web panel and HTTP API.

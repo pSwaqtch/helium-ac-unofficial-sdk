@@ -93,10 +93,14 @@ Then:
 
 ## Notes & limits
 
-- **Fire-and-forget.** The cloud path is QoS-0 with no reliable device ack, so the
-  bridge reports success optimistically and Google's shown state reflects the last
-  command sent, not a fresh read from the unit. (Cloud state reads are intermittent
-  by design — see the main README.)
+- **Indoor temperature is reported.** The bridge reads the unit's room temp
+  (DP `0x6A`, plain °C) — from every command ACK and from a periodic non-actuating
+  read (`REFRESH_SEC`, default 180s) — and pushes it to Google (`REPORT_SEC`,
+  default 60s). The AC exposes no humidity, so humidity is reported as 0%.
+- **Fire-and-forget commands.** The cloud path is QoS-0 with no reliable device
+  ack, so the bridge reports command success optimistically; Google's power/setpoint
+  reflect the last command sent, not a fresh read. (Cloud state reads are
+  intermittent by design — see the main README.)
 - **Relative temperature** ("make it cooler") isn't wired up — use absolute
   ("set AC to 23"). The SDK doesn't hand the bridge a reliable current setpoint to
   offset from over the flaky cloud read.

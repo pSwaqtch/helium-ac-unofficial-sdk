@@ -17,6 +17,7 @@ Setup and running: see bridge/README.md. Credentials come from `.env` (see
 """
 import os
 import sys
+import time
 import queue
 import asyncio
 import logging
@@ -38,8 +39,30 @@ DEVICE_ID = os.environ.get("SINRICPRO_AC_DEVICE_ID", "")
 TEMP_MIN, TEMP_MAX = 16, 30          # unit's accepted setpoint range (README)
 DEFAULT_MODE = "cool"                # what AUTO / a bare power-on maps to
 
+DP_ROOM_TEMP = 0x6A                  # room/indoor temperature °C (PROTOCOL §5e)
+REPORT_SEC = 60                      # push current temp to Google this often
+REFRESH_SEC = 180                    # re-read room temp this often (non-actuating)
+
 # last values we told the AC, so we can echo sensible state back to Google
 _state = {"power": "Off", "setpoint": 24, "mode": DEFAULT_MODE}
+
+# latest room temperature, updated from ACKs and periodic reads; read by the
+# reporter task. `None` until we get a real value (so we never report a fake 0).
+_cache = {"room_temp": None}
+_cache_lock = threading.Lock()
+
+# set once the SinricPro client exists, so the async reporter can raise events
+_client = None
+
+
+def _plausible_temp(t):
+    return t is not None and 0 < t < 60
+
+
+def _cache_room_temp(t):
+    if _plausible_temp(t):
+        with _cache_lock:
+            _cache["room_temp"] = t
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +74,11 @@ _state = {"power": "Off", "setpoint": 24, "mode": DEFAULT_MODE}
 _q: "queue.Queue[str]" = queue.Queue()
 
 
+def _on_ack(_topic, text):
+    """Cache the room temp out of any DP dump the device pushes."""
+    _cache_room_temp(h.parse_ack(text).get(DP_ROOM_TEMP))
+
+
 def _worker():
     cli = None
     while True:
@@ -59,7 +87,7 @@ def _worker():
             try:
                 if cli is None:
                     log.info("connecting to AWS IoT…")
-                    cli = h.connect(timeout=20)
+                    cli = h.connect(on_ack=_on_ack, timeout=20)
                 h.publish_command(payload, cli=cli)
                 break
             except Exception as e:  # noqa: BLE001 — reconnect on any failure
@@ -82,6 +110,41 @@ def send(payload: str):
 
 def _clamp_temp(t) -> int:
     return max(TEMP_MIN, min(TEMP_MAX, int(round(float(t)))))
+
+
+def _temp_refresher():
+    """Periodically read the AC's room temp so Google's 'current temperature'
+    stays fresh even when no commands are being sent. read_state() opens its own
+    short-lived connection and sends no command — it doesn't actuate the unit."""
+    while True:
+        try:
+            rt = h.read_state().get("room_temp_C")
+            if _plausible_temp(rt):
+                _cache_room_temp(rt)
+                log.info("room temp refreshed: %d C", rt)
+        except Exception as e:  # noqa: BLE001 — never let the refresher die
+            log.debug("temp refresh failed: %s", e)
+        time.sleep(REFRESH_SEC)
+
+
+async def _report_current_temperature():
+    """SinricPro event_callbacks entrypoint: push cached room temp to Google on
+    an interval. The AC has no humidity sensor, so humidity is reported as 0."""
+    while True:
+        await asyncio.sleep(REPORT_SEC)
+        with _cache_lock:
+            rt = _cache["room_temp"]
+        if rt is None or _client is None:
+            continue
+        try:
+            _client.event_handler.raise_event(
+                DEVICE_ID,
+                SinricProConstants.CURRENT_TEMPERATURE,
+                data={"temperature": float(rt), "humidity": 0.0},
+            )
+            log.info("reported current temp %d C to Google", rt)
+        except Exception as e:  # noqa: BLE001
+            log.warning("temp report failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +205,11 @@ def main():
             "https://sinric.pro. Details in bridge/README.md."
         )
 
-    # start the MQTT worker before we accept any commands
+    global _client
+
+    # start the MQTT worker and the room-temp refresher before accepting commands
     threading.Thread(target=_worker, name="helium-mqtt", daemon=True).start()
+    threading.Thread(target=_temp_refresher, name="helium-temp", daemon=True).start()
 
     callbacks = {
         SinricProConstants.SET_POWER_STATE: on_power_state,
@@ -151,10 +217,12 @@ def main():
         SinricProConstants.SET_THERMOSTAT_MODE: on_set_thermostat_mode,
     }
 
-    client = SinricPro(
+    _client = SinricPro(
         APP_KEY, [DEVICE_ID], callbacks,
+        event_callbacks=_report_current_temperature,
         enable_log=False, restore_states=False, secret_key=APP_SECRET,
     )
+    client = _client
     log.info("bridge up — device %s; waiting for Google/SinricPro commands", DEVICE_ID)
 
     loop = asyncio.new_event_loop()
