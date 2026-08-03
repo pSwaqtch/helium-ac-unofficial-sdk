@@ -108,3 +108,9 @@ Then:
   controls). They remain available via the web panel and HTTP API.
 - The bridge makes only an **outbound** connection — nothing new is exposed to the
   internet.
+- **Auto-recovery.** The SinricPro SDK doesn't reconnect and ships keepalive pings
+  effectively disabled (a millisecond/second bug), so a dropped websocket would
+  otherwise leave the device stuck "not responding". The bridge forces real
+  keepalive pings and runs a watchdog that exits on a dead socket, letting systemd
+  restart it fresh (`Restart=on-failure`). If the device ever shows offline, check
+  `sudo journalctl _SYSTEMD_USER_UNIT=helium-sinricpro.service -f`.

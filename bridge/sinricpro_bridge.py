@@ -29,8 +29,25 @@ import config  # noqa: E402  (side effect: populates os.environ from .env)
 import helium_cloud as h  # noqa: E402
 
 from sinric import SinricPro, SinricProConstants  # noqa: E402
+import sinric._sinricpro_websocket as _spws  # noqa: E402
 
 log = logging.getLogger("helium-sinric")
+
+# The SDK calls websockets.connect(ping_interval=30000, ping_timeout=10000), but
+# the `websockets` lib takes those in SECONDS — so keepalive pings are ~8h apart,
+# i.e. effectively off, and a dropped SinricPro socket goes undetected forever
+# (device shows "not responding"). Force real second-based keepalive so a dead
+# peer is noticed within ~ping_interval+ping_timeout and the socket is closed.
+_orig_ws_connect = _spws.client.connect
+
+
+def _ws_connect_with_keepalive(*args, **kwargs):
+    kwargs["ping_interval"] = 30
+    kwargs["ping_timeout"] = 15
+    return _orig_ws_connect(*args, **kwargs)
+
+
+_spws.client.connect = _ws_connect_with_keepalive
 
 APP_KEY = os.environ.get("SINRICPRO_APP_KEY", "")
 APP_SECRET = os.environ.get("SINRICPRO_APP_SECRET", "")
@@ -42,6 +59,8 @@ DEFAULT_MODE = "cool"                # what AUTO / a bare power-on maps to
 DP_ROOM_TEMP = 0x6A                  # room/indoor temperature °C (PROTOCOL §5e)
 REPORT_SEC = 60                      # push current temp to Google this often
 REFRESH_SEC = 180                    # re-read room temp this often (non-actuating)
+WATCHDOG_SEC = 20                    # how often to check the SinricPro socket
+WATCHDOG_GRACE = 45                  # let the first connection settle before watching
 
 # last values we told the AC, so we can echo sensible state back to Google
 _state = {"power": "Off", "setpoint": 24, "mode": DEFAULT_MODE}
@@ -147,6 +166,25 @@ async def _report_current_temperature():
             log.warning("temp report failed: %s", e)
 
 
+def _sinric_socket_alive():
+    conn = getattr(getattr(_client, "socket", None), "connection", None)
+    return conn is not None and getattr(conn, "open", False)
+
+
+def _watchdog():
+    """The SDK never reconnects: if its websocket drops, the process keeps
+    running while SinricPro shows the device offline ("not responding"). Watch
+    the socket and, once it's down, exit non-zero so systemd restarts us with a
+    fresh connection (Restart=on-failure). Combined with real keepalive pings, a
+    drop is detected within ~a minute instead of never."""
+    time.sleep(WATCHDOG_GRACE)
+    while True:
+        if not _sinric_socket_alive():
+            log.error("SinricPro websocket is down — exiting for a clean restart")
+            os._exit(1)
+        time.sleep(WATCHDOG_SEC)
+
+
 # ---------------------------------------------------------------------------
 # SinricPro request callbacks. Each is a *plain* function returning (True, value)
 # — the SDK calls it synchronously and expects that tuple (see _power_controller
@@ -207,9 +245,15 @@ def main():
 
     global _client
 
+    # helium_cloud prints every MQTT [ack]/[pub] to stdout; the device polls
+    # constantly so that floods the journal. Send stdout to /dev/null — our logs
+    # (and the SDK's) go to stderr, so they're unaffected.
+    sys.stdout = open(os.devnull, "w")
+
     # start the MQTT worker and the room-temp refresher before accepting commands
     threading.Thread(target=_worker, name="helium-mqtt", daemon=True).start()
     threading.Thread(target=_temp_refresher, name="helium-temp", daemon=True).start()
+    threading.Thread(target=_watchdog, name="helium-watchdog", daemon=True).start()
 
     callbacks = {
         SinricProConstants.SET_POWER_STATE: on_power_state,
@@ -231,6 +275,11 @@ def main():
         loop.run_until_complete(client.connect())
     except KeyboardInterrupt:
         log.info("shutting down")
+        return
+    # connect() only returns/raises when the connection has failed; exit non-zero
+    # so systemd restarts us fresh (the watchdog handles the silent-drop case).
+    log.error("SinricPro connection ended — exiting for a clean restart")
+    raise SystemExit(1)
 
 
 if __name__ == "__main__":
