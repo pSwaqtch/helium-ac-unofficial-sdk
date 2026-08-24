@@ -10,6 +10,13 @@ cloud MQTT payloads the rest of this project sends.
 
     "Hey Google…" → Google Home → SinricPro cloud → (this bridge) → AWS IoT → AC
 
+State flows back the same way. The AC publishes a full DP dump to its ack topic
+whenever something changes — including changes made on the IR remote, which never
+reach this bridge otherwise — so the bridge holds that subscription open and
+raises the matching SinricPro events, keeping Google in sync with the unit:
+
+    AC → AWS IoT → (this bridge) → SinricPro cloud → Google Home
+
 Only the `cloud` transport is used — this box has no Bluetooth radio near the unit.
 
 Setup and running: see bridge/README.md. Credentials come from `.env` (see
@@ -56,19 +63,40 @@ DEVICE_ID = os.environ.get("SINRICPRO_AC_DEVICE_ID", "")
 TEMP_MIN, TEMP_MAX = 16, 30          # unit's accepted setpoint range (README)
 DEFAULT_MODE = "cool"                # what AUTO / a bare power-on maps to
 
-DP_ROOM_TEMP = 0x6A                  # room/indoor temperature °C (PROTOCOL §5e)
+# DPs the device reports in its `Poll:` dumps (PROTOCOL §5e).
+DP_POWER = 0x01                      # 1 = running. NOTE the *report* polarity is
+                                     # plain, unlike power_payload()'s inverted
+                                     # command byte — do not reuse that mapping.
+DP_SETPOINT = 0x02                   # target temperature °C
+DP_MODE = 0x04                       # operating mode, enum (see _google_mode)
+DP_ROOM_TEMP = 0x6A                  # room/indoor temperature °C
+
+# This unit's remote offers Cool, Monsoon (dry) and "AI Cool" — no heat. Google's
+# thermostat vocabulary is only AUTO/COOL/HEAT, so the two smart/dry modes both
+# land on AUTO; it is the honest nearest fit and keeps the tile from lying about
+# heating. DP 0x04 == 1 is cool (mode_payload encodes cool as 1); the other enum
+# values are unmapped, hence the log line in _google_mode.
+MODE_COOL = 1
+
 REPORT_SEC = 60                      # push current temp to Google this often
-REFRESH_SEC = 180                    # re-read room temp this often (non-actuating)
+STALE_SEC = 900                      # stop reporting a reading older than this
+IDLE_POLL_SEC = 5                    # how long the worker waits for a command
 WATCHDOG_SEC = 20                    # how often to check the SinricPro socket
 WATCHDOG_GRACE = 45                  # let the first connection settle before watching
 
 # last values we told the AC, so we can echo sensible state back to Google
 _state = {"power": "Off", "setpoint": 24, "mode": DEFAULT_MODE}
 
-# latest room temperature, updated from ACKs and periodic reads; read by the
-# reporter task. `None` until we get a real value (so we never report a fake 0).
-_cache = {"room_temp": None}
+# Latest state heard *from* the AC. The device pushes a full DP dump whenever
+# something changes — including changes made on the IR remote, which never touch
+# this bridge — so this is how we learn about them. `None` until the device has
+# actually told us (so we never report a fabricated value).
+_cache = {"room_temp": None, "room_temp_at": 0.0}
 _cache_lock = threading.Lock()
+
+# last values we pushed to SinricPro, so we only raise an event on a real change
+# (SinricPro rate-limits events, and Google gets noisy if you spam it)
+_reported = {"power": None, "setpoint": None, "mode": None, "mode_dp": None}
 
 # set once the SinricPro client exists, so the async reporter can raise events
 _client = None
@@ -82,6 +110,73 @@ def _cache_room_temp(t):
     if _plausible_temp(t):
         with _cache_lock:
             _cache["room_temp"] = t
+            _cache["room_temp_at"] = time.time()
+
+
+def _raise(event, data, what):
+    """Push one state event to SinricPro, tolerating a not-yet-open socket.
+
+    Safe to call from the MQTT thread: raise_event only appends to a plain
+    thread-safe queue.Queue, which the SDK's asyncio task drains once connected.
+    """
+    if _client is None:
+        return
+    try:
+        _client.event_handler.raise_event(DEVICE_ID, event, data=data)
+        log.info("reported %s to Google", what)
+    except Exception as e:  # noqa: BLE001 — a failed report must not kill the listener
+        log.warning("report of %s failed: %s", what, e)
+
+
+def _google_mode(power, mode_dp):
+    """Map the device's power + mode DPs onto a Google thermostat mode."""
+    if not power:
+        return SinricProConstants.THERMOSTAT_MODE_OFF
+    if mode_dp is None or mode_dp == MODE_COOL:
+        return SinricProConstants.THERMOSTAT_MODE_COOL
+    log.info("DP 0x%02X = %s is an unmapped mode — reporting AUTO", DP_MODE, mode_dp)
+    return SinricProConstants.THERMOSTAT_MODE_AUTO
+
+
+def _report_device_state(dps):
+    """Mirror a device-reported DP dump up to Google, on change only.
+
+    Without this the bridge is one-way: Google only ever sees state it asked for
+    itself, so anything done on the remote (or the vendor app) leaves Google
+    showing a stale power/setpoint indefinitely.
+    """
+    power = dps.get(DP_POWER)
+    if power is not None:
+        state = (SinricProConstants.POWER_STATE_ON if power
+                 else SinricProConstants.POWER_STATE_OFF)
+        if state != _reported["power"]:
+            _reported["power"] = state
+            _state["power"] = state
+            _raise(SinricProConstants.SET_POWER_STATE, {"state": state},
+                   f"power {state}")
+
+    setpoint = dps.get(DP_SETPOINT)
+    if setpoint is not None and TEMP_MIN <= setpoint <= TEMP_MAX:
+        if setpoint != _reported["setpoint"]:
+            _reported["setpoint"] = setpoint
+            _state["setpoint"] = setpoint
+            _raise(SinricProConstants.TARGET_TEMPERATURE,
+                   {"temperature": float(setpoint)}, f"setpoint {setpoint} C")
+
+    # Mode is derived from power *and* the mode DP, so a dump carrying only one
+    # of them still yields the right answer — fall back to what we last knew.
+    if power is not None or DP_MODE in dps:
+        gmode = _google_mode(
+            power if power is not None else (_reported["power"] ==
+                                             SinricProConstants.POWER_STATE_ON),
+            dps.get(DP_MODE, _reported["mode_dp"]),
+        )
+        if DP_MODE in dps:
+            _reported["mode_dp"] = dps[DP_MODE]
+        if gmode != _reported["mode"]:
+            _reported["mode"] = gmode
+            _raise(SinricProConstants.SET_THERMOSTAT_MODE,
+                   {SinricProConstants.MODE: gmode}, f"mode {gmode}")
 
 
 # ---------------------------------------------------------------------------
@@ -94,30 +189,64 @@ _q: "queue.Queue[str]" = queue.Queue()
 
 
 def _on_ack(_topic, text):
-    """Cache the room temp out of any DP dump the device pushes."""
-    _cache_room_temp(h.parse_ack(text).get(DP_ROOM_TEMP))
+    """Absorb a DP dump from the device: cache the room temp, mirror state up.
+
+    The device pushes one of these whenever a DP changes, so this is the only
+    place a remote-control change can enter the bridge.
+    """
+    dps = h.parse_ack(text)
+    if not dps:
+        return
+    _cache_room_temp(dps.get(DP_ROOM_TEMP))
+    _report_device_state(dps)
 
 
 def _worker():
+    """Own the MQTT client: connect eagerly, keep it up, publish queued commands.
+
+    The connection is established at startup rather than on the first command,
+    because its ack subscription is what feeds `_on_ack`. Deferring it would mean
+    hearing nothing from the AC until Google happened to send something.
+    """
     cli = None
     while True:
-        payload = _q.get()
+        if cli is None:
+            try:
+                log.info("connecting to AWS IoT…")
+                cli = h.connect(on_ack=_on_ack, timeout=20)
+                log.info("listening for AC state on %s", h.ACK_TOPIC)
+            except Exception as e:  # noqa: BLE001 — keep retrying, never exit
+                log.warning("AWS IoT connect failed, retrying: %s", e)
+                time.sleep(10)
+                continue
+
+        try:
+            payload = _q.get(timeout=IDLE_POLL_SEC)
+        except queue.Empty:
+            # idle: paho reconnects on its own (and _on_connect re-subscribes),
+            # so just note a drop rather than tearing the client down under it
+            if not cli.is_connected():
+                log.warning("AWS IoT link down — paho is reconnecting")
+            continue
+
         for attempt in (1, 2):
             try:
-                if cli is None:
-                    log.info("connecting to AWS IoT…")
-                    cli = h.connect(on_ack=_on_ack, timeout=20)
                 h.publish_command(payload, cli=cli)
                 break
             except Exception as e:  # noqa: BLE001 — reconnect on any failure
                 log.warning("publish failed (attempt %d/2): %s", attempt, e)
                 try:
-                    if cli:
-                        cli.loop_stop()
-                        cli.disconnect()
+                    cli.loop_stop()
+                    cli.disconnect()
                 except Exception:
                     pass
                 cli = None
+                try:
+                    cli = h.connect(on_ack=_on_ack, timeout=20)
+                except Exception as e2:  # noqa: BLE001
+                    log.warning("reconnect failed: %s", e2)
+                    cli = None
+                    break
         else:
             log.error("gave up on payload %s", payload)
 
@@ -131,39 +260,27 @@ def _clamp_temp(t) -> int:
     return max(TEMP_MIN, min(TEMP_MAX, int(round(float(t)))))
 
 
-def _temp_refresher():
-    """Periodically read the AC's room temp so Google's 'current temperature'
-    stays fresh even when no commands are being sent. read_state() opens its own
-    short-lived connection and sends no command — it doesn't actuate the unit."""
-    while True:
-        try:
-            rt = h.read_state().get("room_temp_C")
-            if _plausible_temp(rt):
-                _cache_room_temp(rt)
-                log.info("room temp refreshed: %d C", rt)
-        except Exception as e:  # noqa: BLE001 — never let the refresher die
-            log.debug("temp refresh failed: %s", e)
-        time.sleep(REFRESH_SEC)
-
-
 async def _report_current_temperature():
     """SinricPro event_callbacks entrypoint: push cached room temp to Google on
-    an interval. The AC has no humidity sensor, so humidity is reported as 0."""
+    an interval. The AC has no humidity sensor, so humidity is reported as 0.
+
+    The device only reports when a DP changes, and it goes quiet entirely while
+    idle or powered off — so a cached reading can outlive its truth. Past
+    STALE_SEC we stop reporting rather than keep asserting a stale number.
+    """
     while True:
         await asyncio.sleep(REPORT_SEC)
         with _cache_lock:
-            rt = _cache["room_temp"]
+            rt, at = _cache["room_temp"], _cache["room_temp_at"]
         if rt is None or _client is None:
             continue
-        try:
-            _client.event_handler.raise_event(
-                DEVICE_ID,
-                SinricProConstants.CURRENT_TEMPERATURE,
-                data={"temperature": float(rt), "humidity": 0.0},
-            )
-            log.info("reported current temp %d C to Google", rt)
-        except Exception as e:  # noqa: BLE001
-            log.warning("temp report failed: %s", e)
+        age = time.time() - at
+        if age > STALE_SEC:
+            log.warning("room temp is %d min old — not reporting", age // 60)
+            continue
+        _raise(SinricProConstants.CURRENT_TEMPERATURE,
+               {"temperature": float(rt), "humidity": 0.0},
+               f"current temp {rt} C")
 
 
 def _sinric_socket_alive():
@@ -196,6 +313,10 @@ def on_power_state(device_id, state):
     log.info("power -> %s", state)
     send(h.power_payload(on))
     _state["power"] = state
+    # Google already knows — record it so the device's confirming dump doesn't
+    # bounce straight back as an event. A dump that *disagrees* still will.
+    _reported["power"] = state
+    _reported["mode"] = _google_mode(on, _reported["mode_dp"])
     return True, state
 
 
@@ -205,23 +326,35 @@ def on_target_temperature(device_id, temperature):
     log.info("setpoint -> %d C", t)
     send(h.temperature_payload(t))
     _state["setpoint"] = t
+    _reported["setpoint"] = t     # suppress the echo; see on_power_state
     return True, t
 
 
 def on_set_thermostat_mode(device_id, mode):
-    """mode is COOL / HEAT / AUTO / OFF (Google's thermostat modes)."""
+    """mode is COOL / HEAT / AUTO / OFF (Google's thermostat modes).
+
+    This unit cools only — its remote offers Cool, Monsoon and "AI Cool". HEAT is
+    refused rather than silently doing something else, so Google reports a failure
+    instead of the tile claiming a mode the hardware cannot enter.
+    """
     mode = (mode or "").upper()
     log.info("mode -> %s", mode)
     if mode == SinricProConstants.THERMOSTAT_MODE_OFF:
         send(h.power_payload(False))
-        _state["power"] = "Off"
+        _state["power"] = _reported["power"] = "Off"
+        _reported["mode"] = mode
         return True, mode
-    # COOL / HEAT / AUTO → make sure it's on, then set the operating mode
-    hmode = "heat" if mode == SinricProConstants.THERMOSTAT_MODE_HEAT else "cool"
+    if mode == SinricProConstants.THERMOSTAT_MODE_HEAT:
+        log.warning("HEAT requested but this AC cannot heat — refusing")
+        return False, mode
+    # COOL / AUTO → make sure it's on, then cool. AUTO has no separate command:
+    # mode_payload is binary (cool / not-cool), so the unit's own smart modes
+    # can't be selected remotely — only observed.
     send(h.power_payload(True))
-    send(h.mode_payload(hmode))
-    _state["power"] = "On"
-    _state["mode"] = hmode
+    send(h.mode_payload("cool"))
+    _state["power"] = _reported["power"] = "On"
+    _state["mode"] = "cool"
+    _reported["mode"] = SinricProConstants.THERMOSTAT_MODE_COOL
     return True, mode
 
 
@@ -250,9 +383,9 @@ def main():
     # (and the SDK's) go to stderr, so they're unaffected.
     sys.stdout = open(os.devnull, "w")
 
-    # start the MQTT worker and the room-temp refresher before accepting commands
+    # start the MQTT worker (which also opens the state listener) before
+    # accepting commands
     threading.Thread(target=_worker, name="helium-mqtt", daemon=True).start()
-    threading.Thread(target=_temp_refresher, name="helium-temp", daemon=True).start()
     threading.Thread(target=_watchdog, name="helium-watchdog", daemon=True).start()
 
     callbacks = {
