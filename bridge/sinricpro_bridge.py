@@ -78,7 +78,18 @@ DP_ROOM_TEMP = 0x6A                  # room/indoor temperature °C
 # values are unmapped, hence the log line in _google_mode.
 MODE_COOL = 1
 
-REPORT_SEC = 60                      # push current temp to Google this often
+# Event pacing. The SDK silently drops events through a leaky bucket
+# (_callback_handler.py: LeakyBucket(10, 1000, 60000)) — a burst of 10, then one
+# drop leaks per ~60s of quiet, so the sustained budget is about one event a
+# minute and anything over it vanishes with no error. Everything below exists to
+# stay under that: send only on change, let a burst of remote presses settle
+# before sending, space sends out, and re-assert state occasionally so a dropped
+# event cannot leave Google permanently disagreeing with the unit.
+SEND_TICK_SEC = 2                    # how often the reporter looks for work
+DEBOUNCE_SEC = 4                     # let a run of remote presses settle first
+MIN_GAP_SEC = 3                      # minimum spacing between events we send
+TEMP_INTERVAL_SEC = 300              # ambient temp: at most this often, on change
+RECONCILE_SEC = 600                  # re-assert full state this often
 STALE_SEC = 900                      # stop reporting a reading older than this
 IDLE_POLL_SEC = 5                    # how long the worker waits for a command
 WATCHDOG_SEC = 20                    # how often to check the SinricPro socket
@@ -94,9 +105,14 @@ _state = {"power": "Off", "setpoint": 24, "mode": DEFAULT_MODE}
 _cache = {"room_temp": None, "room_temp_at": 0.0}
 _cache_lock = threading.Lock()
 
-# last values we pushed to SinricPro, so we only raise an event on a real change
-# (SinricPro rate-limits events, and Google gets noisy if you spam it)
-_reported = {"power": None, "setpoint": None, "mode": None, "mode_dp": None}
+# What the AC actually is (`_desired`) versus what SinricPro has been told
+# (`_sent`). The reporter thread closes the gap one event at a time, within the
+# pacing budget above. `mode_dp` is the raw DP, kept to derive the Google mode.
+_desired = {"power": None, "setpoint": None, "mode": None, "temp": None}
+_sent = {"power": None, "setpoint": None, "mode": None, "temp": None}
+_reported = {"mode_dp": None}
+_desired_at = 0.0                    # when _desired last changed (for debounce)
+_send_state = {"last_send": 0.0, "last_temp": 0.0, "last_reconcile": time.time()}
 
 # set once the SinricPro client exists, so the async reporter can raise events
 _client = None
@@ -106,11 +122,32 @@ def _plausible_temp(t):
     return t is not None and 0 < t < 60
 
 
+def _want(key, value):
+    """Record what the AC now is; the reporter sends it when the budget allows."""
+    global _desired_at
+    with _cache_lock:
+        if _desired[key] != value:
+            _desired[key] = value
+            _desired_at = time.time()
+
+
+def _assume(key, value):
+    """Record a value Google itself just commanded: desired *and* already sent.
+
+    Keeps the device's confirming dump from bouncing straight back as a redundant
+    event — every one of those costs budget. A dump that *disagrees* still gets
+    sent, because then desired moves away from sent again.
+    """
+    _want(key, value)
+    _sent[key] = value
+
+
 def _cache_room_temp(t):
     if _plausible_temp(t):
         with _cache_lock:
             _cache["room_temp"] = t
             _cache["room_temp_at"] = time.time()
+        _want("temp", t)
 
 
 def _raise(event, data, what):
@@ -139,44 +176,97 @@ def _google_mode(power, mode_dp):
 
 
 def _report_device_state(dps):
-    """Mirror a device-reported DP dump up to Google, on change only.
+    """Absorb a device-reported DP dump into `_desired`.
 
     Without this the bridge is one-way: Google only ever sees state it asked for
     itself, so anything done on the remote (or the vendor app) leaves Google
-    showing a stale power/setpoint indefinitely.
+    showing a stale power/setpoint indefinitely. Nothing is sent from here — the
+    reporter thread owns sending, so a burst of remote presses collapses into one
+    event instead of spending the whole rate-limit budget.
     """
     power = dps.get(DP_POWER)
     if power is not None:
         state = (SinricProConstants.POWER_STATE_ON if power
                  else SinricProConstants.POWER_STATE_OFF)
-        if state != _reported["power"]:
-            _reported["power"] = state
-            _state["power"] = state
-            _raise(SinricProConstants.SET_POWER_STATE, {"state": state},
-                   f"power {state}")
+        _state["power"] = state
+        _want("power", state)
 
     setpoint = dps.get(DP_SETPOINT)
     if setpoint is not None and TEMP_MIN <= setpoint <= TEMP_MAX:
-        if setpoint != _reported["setpoint"]:
-            _reported["setpoint"] = setpoint
-            _state["setpoint"] = setpoint
-            _raise(SinricProConstants.TARGET_TEMPERATURE,
-                   {"temperature": float(setpoint)}, f"setpoint {setpoint} C")
+        _state["setpoint"] = setpoint
+        _want("setpoint", setpoint)
 
     # Mode is derived from power *and* the mode DP, so a dump carrying only one
     # of them still yields the right answer — fall back to what we last knew.
     if power is not None or DP_MODE in dps:
-        gmode = _google_mode(
-            power if power is not None else (_reported["power"] ==
-                                             SinricProConstants.POWER_STATE_ON),
-            dps.get(DP_MODE, _reported["mode_dp"]),
-        )
         if DP_MODE in dps:
             _reported["mode_dp"] = dps[DP_MODE]
-        if gmode != _reported["mode"]:
-            _reported["mode"] = gmode
-            _raise(SinricProConstants.SET_THERMOSTAT_MODE,
-                   {SinricProConstants.MODE: gmode}, f"mode {gmode}")
+        known_on = _desired["power"] == SinricProConstants.POWER_STATE_ON
+        _want("mode", _google_mode(power if power is not None else known_on,
+                                   _reported["mode_dp"]))
+
+
+# events the reporter can send, in the order it prefers them when several are
+# outstanding — power first because a wrong on/off is the most misleading
+_SENDERS = (
+    ("power", SinricProConstants.SET_POWER_STATE,
+     lambda v: {"state": v}, lambda v: f"power {v}"),
+    ("mode", SinricProConstants.SET_THERMOSTAT_MODE,
+     lambda v: {SinricProConstants.MODE: v}, lambda v: f"mode {v}"),
+    ("setpoint", SinricProConstants.TARGET_TEMPERATURE,
+     lambda v: {"temperature": float(v)}, lambda v: f"setpoint {v} C"),
+    ("temp", SinricProConstants.CURRENT_TEMPERATURE,
+     lambda v: {"temperature": float(v), "humidity": 0.0},
+     lambda v: f"current temp {v} C"),
+)
+
+
+def _temp_sendable(now):
+    """Ambient temp is the least urgent value and the easiest to overspend on:
+    hold it to TEMP_INTERVAL_SEC, and never assert a reading that has gone
+    stale (the AC stops reporting entirely when it is idle or powered off)."""
+    if now - _send_state["last_temp"] < TEMP_INTERVAL_SEC:
+        return False
+    with _cache_lock:
+        age = now - _cache["room_temp_at"]
+    if age > STALE_SEC:
+        log.warning("room temp is %d min old — not reporting", age // 60)
+        return False
+    return True
+
+
+def _send_due():
+    """Send at most one outstanding state event, respecting the pacing budget."""
+    now = time.time()
+    if _client is None or now - _send_state["last_send"] < MIN_GAP_SEC:
+        return
+    with _cache_lock:
+        desired = dict(_desired)
+        settled = now - _desired_at >= DEBOUNCE_SEC
+    if not settled:
+        return
+
+    # Periodically forget what we have sent, so everything is re-asserted. A
+    # dropped event is invisible to us — this is what stops one from leaving
+    # Google stuck on a wrong value forever.
+    if now - _send_state["last_reconcile"] >= RECONCILE_SEC:
+        _send_state["last_reconcile"] = now
+        for k in _sent:
+            _sent[k] = None
+        log.info("re-asserting state to Google")
+
+    for key, event, payload, describe in _SENDERS:
+        value = desired[key]
+        if value is None or value == _sent[key]:
+            continue
+        if key == "temp" and not _temp_sendable(now):
+            continue
+        _raise(event, payload(value), describe(value))
+        _sent[key] = value
+        _send_state["last_send"] = now
+        if key == "temp":
+            _send_state["last_temp"] = now
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -260,27 +350,19 @@ def _clamp_temp(t) -> int:
     return max(TEMP_MIN, min(TEMP_MAX, int(round(float(t)))))
 
 
-async def _report_current_temperature():
-    """SinricPro event_callbacks entrypoint: push cached room temp to Google on
-    an interval. The AC has no humidity sensor, so humidity is reported as 0.
+async def _reporter():
+    """SinricPro event_callbacks entrypoint: the one place events are sent.
 
-    The device only reports when a DP changes, and it goes quiet entirely while
-    idle or powered off — so a cached reading can outlive its truth. Past
-    STALE_SEC we stop reporting rather than keep asserting a stale number.
+    Runs on the SDK's event loop and does no blocking work — _send_due() only
+    appends to the SDK's thread-safe queue. The AC has no humidity sensor, so
+    humidity is reported as 0.
     """
     while True:
-        await asyncio.sleep(REPORT_SEC)
-        with _cache_lock:
-            rt, at = _cache["room_temp"], _cache["room_temp_at"]
-        if rt is None or _client is None:
-            continue
-        age = time.time() - at
-        if age > STALE_SEC:
-            log.warning("room temp is %d min old — not reporting", age // 60)
-            continue
-        _raise(SinricProConstants.CURRENT_TEMPERATURE,
-               {"temperature": float(rt), "humidity": 0.0},
-               f"current temp {rt} C")
+        await asyncio.sleep(SEND_TICK_SEC)
+        try:
+            _send_due()
+        except Exception as e:  # noqa: BLE001 — never let the reporter die
+            log.warning("reporter tick failed: %s", e)
 
 
 def _sinric_socket_alive():
@@ -313,10 +395,8 @@ def on_power_state(device_id, state):
     log.info("power -> %s", state)
     send(h.power_payload(on))
     _state["power"] = state
-    # Google already knows — record it so the device's confirming dump doesn't
-    # bounce straight back as an event. A dump that *disagrees* still will.
-    _reported["power"] = state
-    _reported["mode"] = _google_mode(on, _reported["mode_dp"])
+    _assume("power", state)
+    _assume("mode", _google_mode(on, _reported["mode_dp"]))
     return True, state
 
 
@@ -326,7 +406,7 @@ def on_target_temperature(device_id, temperature):
     log.info("setpoint -> %d C", t)
     send(h.temperature_payload(t))
     _state["setpoint"] = t
-    _reported["setpoint"] = t     # suppress the echo; see on_power_state
+    _assume("setpoint", t)
     return True, t
 
 
@@ -341,8 +421,9 @@ def on_set_thermostat_mode(device_id, mode):
     log.info("mode -> %s", mode)
     if mode == SinricProConstants.THERMOSTAT_MODE_OFF:
         send(h.power_payload(False))
-        _state["power"] = _reported["power"] = "Off"
-        _reported["mode"] = mode
+        _state["power"] = "Off"
+        _assume("power", "Off")
+        _assume("mode", mode)
         return True, mode
     if mode == SinricProConstants.THERMOSTAT_MODE_HEAT:
         log.warning("HEAT requested but this AC cannot heat — refusing")
@@ -352,9 +433,10 @@ def on_set_thermostat_mode(device_id, mode):
     # can't be selected remotely — only observed.
     send(h.power_payload(True))
     send(h.mode_payload("cool"))
-    _state["power"] = _reported["power"] = "On"
+    _state["power"] = "On"
     _state["mode"] = "cool"
-    _reported["mode"] = SinricProConstants.THERMOSTAT_MODE_COOL
+    _assume("power", "On")
+    _assume("mode", SinricProConstants.THERMOSTAT_MODE_COOL)
     return True, mode
 
 
@@ -396,7 +478,7 @@ def main():
 
     _client = SinricPro(
         APP_KEY, [DEVICE_ID], callbacks,
-        event_callbacks=_report_current_temperature,
+        event_callbacks=_reporter,
         enable_log=False, restore_states=False, secret_key=APP_SECRET,
     )
     client = _client
