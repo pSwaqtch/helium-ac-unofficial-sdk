@@ -69,7 +69,19 @@ DP_POWER = 0x01                      # 1 = running. NOTE the *report* polarity i
                                      # command byte — do not reuse that mapping.
 DP_SETPOINT = 0x02                   # target temperature °C
 DP_MODE = 0x04                       # operating mode, enum (see _google_mode)
+DP_FAN = 0x05                        # fan speed enum (PROTOCOL §7k: DP5 CONFIRMED)
 DP_ROOM_TEMP = 0x6A                  # room/indoor temperature °C
+
+# Fan speed doubles as the SinricPro range value: index == DP5 value == the
+# number the assistant sends, so the device's Range capability must be configured
+# 0..3 in the portal. NOTE DP5 also carries 4 for turbo (PROTOCOL §7k), which is
+# not a fan speed — values outside this tuple are ignored rather than reported.
+#
+# Google Home will NOT show this: SinricPro's Range capability is documented as
+# unsupported there (Alexa / SmartThings / the SinricPro app only). Exposing fan
+# speed to Google needs the Mode capability instead, which costs another device
+# license, so it is deliberately not done here.
+FAN_BY_INDEX = ("auto", "low", "medium", "high")
 
 # This unit's remote offers Cool, Monsoon (dry) and "AI Cool" — no heat. Google's
 # thermostat vocabulary is only AUTO/COOL/HEAT, so the two smart/dry modes both
@@ -108,8 +120,8 @@ _cache_lock = threading.Lock()
 # What the AC actually is (`_desired`) versus what SinricPro has been told
 # (`_sent`). The reporter thread closes the gap one event at a time, within the
 # pacing budget above. `mode_dp` is the raw DP, kept to derive the Google mode.
-_desired = {"power": None, "setpoint": None, "mode": None, "temp": None}
-_sent = {"power": None, "setpoint": None, "mode": None, "temp": None}
+_desired = {"power": None, "setpoint": None, "mode": None, "fan": None, "temp": None}
+_sent = {"power": None, "setpoint": None, "mode": None, "fan": None, "temp": None}
 _reported = {"mode_dp": None}
 _desired_at = 0.0                    # when _desired last changed (for debounce)
 _send_state = {"last_send": 0.0, "last_temp": 0.0, "last_reconcile": time.time()}
@@ -196,6 +208,14 @@ def _report_device_state(dps):
         _state["setpoint"] = setpoint
         _want("setpoint", setpoint)
 
+    fan = dps.get(DP_FAN)
+    if fan is not None:
+        if 0 <= fan < len(FAN_BY_INDEX):
+            _want("fan", fan)
+        else:
+            # turbo parks 4 here; not a speed, so leave the last one standing
+            log.debug("DP 0x%02X = %s is not a fan speed — ignoring", DP_FAN, fan)
+
     # Mode is derived from power *and* the mode DP, so a dump carrying only one
     # of them still yields the right answer — fall back to what we last knew.
     if power is not None or DP_MODE in dps:
@@ -215,6 +235,9 @@ _SENDERS = (
      lambda v: {SinricProConstants.MODE: v}, lambda v: f"mode {v}"),
     ("setpoint", SinricProConstants.TARGET_TEMPERATURE,
      lambda v: {"temperature": float(v)}, lambda v: f"setpoint {v} C"),
+    ("fan", SinricProConstants.SET_RANGE_VALUE,
+     lambda v: {SinricProConstants.RANGE_VALUE: v},
+     lambda v: f"fan {FAN_BY_INDEX[v]}"),
     ("temp", SinricProConstants.CURRENT_TEMPERATURE,
      lambda v: {"temperature": float(v), "humidity": 0.0},
      lambda v: f"current temp {v} C"),
@@ -410,6 +433,21 @@ def on_target_temperature(device_id, temperature):
     return True, t
 
 
+def on_set_range_value(device_id, range_value, instance_id=None):
+    """Fan speed, as a 0..3 range value — see FAN_BY_INDEX for the mapping."""
+    try:
+        idx = int(range_value)
+    except (TypeError, ValueError):
+        log.warning("un-parseable fan range value %r — ignoring", range_value)
+        return False, range_value
+    idx = max(0, min(len(FAN_BY_INDEX) - 1, idx))
+    log.info("fan -> %s", FAN_BY_INDEX[idx])
+    send(h.fan_payload(FAN_BY_INDEX[idx]))
+    _state["fan"] = FAN_BY_INDEX[idx]
+    _assume("fan", idx)
+    return True, idx
+
+
 def on_set_thermostat_mode(device_id, mode):
     """mode is COOL / HEAT / AUTO / OFF (Google's thermostat modes).
 
@@ -474,6 +512,7 @@ def main():
         SinricProConstants.SET_POWER_STATE: on_power_state,
         SinricProConstants.TARGET_TEMPERATURE: on_target_temperature,
         SinricProConstants.SET_THERMOSTAT_MODE: on_set_thermostat_mode,
+        SinricProConstants.SET_RANGE_VALUE: on_set_range_value,
     }
 
     _client = SinricPro(
