@@ -24,6 +24,7 @@ Setup and running: see bridge/README.md. Credentials come from `.env` (see
 """
 import os
 import sys
+import json
 import time
 import queue
 import asyncio
@@ -60,13 +61,20 @@ APP_KEY = os.environ.get("SINRICPRO_APP_KEY", "")
 APP_SECRET = os.environ.get("SINRICPRO_APP_SECRET", "")
 DEVICE_ID = os.environ.get("SINRICPRO_AC_DEVICE_ID", "")
 
-# Opt-in reachability heartbeat (HELIUM_BRIDGE_PROBE=1 in .env). While the AC is
-# quiet it echoes the unit's own setpoint back every PROBE_SEC, so an outage is
-# discovered before the next voice command instead of by failing it. Off by
-# default: it is a real publish to the unit, and whether a no-op setpoint makes it
-# beep (or wakes an idle unit) is untested — see bridge/README.md.
-PROBE_ENABLED = os.environ.get("HELIUM_BRIDGE_PROBE", "").strip().lower() in (
-    "1", "true", "yes", "on")
+# Set HELIUM_BRIDGE_PROBE=0 in .env to stop the bridge ever publishing on its own
+# (see the prod in _tick_reachability). That also removes the only evidence it has
+# for refusing a command, so it goes back to reporting every command as a success.
+PROBE_ENABLED = os.environ.get("HELIUM_BRIDGE_PROBE", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+
+# Where the reachability verdict is kept across restarts. systemd restarts this
+# process on a dead SinricPro socket (a couple of times a day), and an outage
+# outlives that by a long way — the one that prompted all this lasted two days.
+# Without persistence every restart would forget that the AC is not answering and
+# go back to reporting false successes, which is the whole bug.
+STATE_PATH = os.environ.get(
+    "HELIUM_BRIDGE_STATE",
+    os.path.join(os.path.expanduser("~/.cache"), "helium-sinricpro-state.json"))
 
 TEMP_MIN, TEMP_MAX = 16, 30          # unit's accepted setpoint range (README)
 DEFAULT_MODE = "cool"                # what AUTO / a bare power-on maps to
@@ -113,23 +121,23 @@ RECONCILE_SEC = 600                  # re-assert full state this often
 STALE_SEC = 900                      # stop reporting a reading older than this
 IDLE_POLL_SEC = 5                    # how long the worker waits for a command
 
-# Reachability, and why the threshold is this large. MEASURED against the real
-# unit, because the obvious guesses are both wrong:
+# Reachability. MEASURED against the real unit, because every cheaper test is
+# wrong. The unit does NOT chatter: it publishes a burst of ~7 dumps at 6s
+# intervals and then goes silent for many minutes (9min observed) while remaining
+# perfectly controllable — a prod answered in 21.5s with the unit running at
+# 272W. Fleet-wide, a quarter of units send ≤2 messages in any 150s window. So
+# silence is not evidence of anything, at any threshold worth gating a voice
+# command on, and neither is "no answer within N seconds" (the same prod drew a
+# dump after 8s, 21.5s and ~25s on three tries).
 #
-#   * The AC does NOT chatter continuously. It publishes a burst of ~7 dumps at
-#     6s intervals and then goes silent for minutes — observed gaps up to ~5min
-#     on a unit that was demonstrably alive and controllable. Fleet-wide, about a
-#     quarter of units send ≤2 messages in any 150s window.
-#   * A command is not answered on a predictable schedule either: the same no-op
-#     publish drew a dump 8s later once and ~25s later another time.
-#
-# So a short quiet window means nothing, and "no answer within N seconds" is not
-# a sound test at any N small enough to gate a voice command on. What *is* sound
-# is a long silence: the real outage that motivated all this lasted two days and
-# answered nothing at all. 15min is ~3x the longest silence seen from a live unit,
-# so it never refuses a working AC, and it still catches a dead one in minutes.
-OFFLINE_AFTER_SEC = 900              # silence this long = genuinely off the cloud
-PROBE_SEC = 180                      # opt-in heartbeat: re-prove a quiet unit
+# The only sound test is therefore to *ask*: once the AC has been silent a long
+# while, echo its own state back at it and see whether it answers. Nothing is
+# concluded from silence alone; a prod that goes unanswered is what marks the unit
+# off the cloud, and only then are commands refused.
+OFFLINE_AFTER_SEC = 900              # silence after which we stop assuming and ask
+PROBE_SEC = 180                      # min spacing between prods while still silent
+ANSWER_GRACE_SEC = 60                # prod unanswered this long = off the cloud
+TRUST_SAVED_SEC = 3600               # ignore a saved setpoint older than this
 WATCHDOG_SEC = 20                    # how often to check the SinricPro socket
 WATCHDOG_GRACE = 45                  # let the first connection settle before watching
 
@@ -144,16 +152,16 @@ _cache = {"room_temp": None, "room_temp_at": 0.0, "heard_at": 0.0}
 _cache_lock = threading.Lock()
 
 # `reachable` is the last *logged* belief, so a unit that is off the cloud for
-# days costs two log lines rather than thousands; `last_probe` paces the opt-in
-# heartbeat below.
-_probe = {"last_probe": 0.0, "reachable": None}
+# days costs two log lines rather than thousands. `awaiting_since` is set when a
+# prod goes out and cleared by the answer; `last_probe` paces the prods.
+_probe = {"last_probe": 0.0, "awaiting_since": 0.0, "reachable": None}
 
 # What the AC actually is (`_desired`) versus what SinricPro has been told
 # (`_sent`). The reporter thread closes the gap one event at a time, within the
 # pacing budget above. `mode_dp` is the raw DP, kept to derive the Google mode.
 _desired = {"power": None, "setpoint": None, "mode": None, "fan": None, "temp": None}
 _sent = {"power": None, "setpoint": None, "mode": None, "fan": None, "temp": None}
-_reported = {"mode_dp": None, "setpoint_dev": None}
+_reported = {"mode_dp": None, "setpoint_dev": None, "power_dev": None}
 _desired_at = 0.0                    # when _desired last changed (for debounce)
 _send_state = {"last_send": 0.0, "last_temp": 0.0, "last_reconcile": time.time(),
                "last_stale_log": 0.0}
@@ -194,6 +202,56 @@ def _cache_room_temp(t):
         _want("temp", t)
 
 
+def _save_state():
+    """Persist just enough to survive a restart: the verdict, and the device-
+    reported values the prod needs. Best-effort — never let it break the bridge."""
+    try:
+        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+        with _cache_lock:
+            data = {"reachable": _probe["reachable"],
+                    "setpoint_dev": _reported["setpoint_dev"],
+                    "power_dev": _reported["power_dev"],
+                    "heard_at": _cache["heard_at"],
+                    "saved_at": time.time()}
+        tmp = STATE_PATH + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, STATE_PATH)      # atomic: never leave a half-written file
+    except Exception as e:  # noqa: BLE001
+        log.debug("could not save state to %s: %s", STATE_PATH, e)
+
+
+def _load_state():
+    """Restore the verdict from the previous run, if there was one.
+
+    A saved "not answering" keeps refusing until the AC actually speaks again —
+    which is the only thing that can clear it, so a restart cannot launder a dead
+    unit back into looking healthy. The saved setpoint is only trusted while it is
+    fresh (TRUST_SAVED_SEC): echoing a stale one at a unit that has since been set
+    to something else by the remote would *move* its setpoint, which the prod must
+    never do.
+    """
+    try:
+        with open(STATE_PATH) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return
+    except Exception as e:  # noqa: BLE001 — a corrupt file is not worth dying over
+        log.warning("ignoring unreadable state file %s: %s", STATE_PATH, e)
+        return
+
+    saved_at = data.get("saved_at") or 0
+    age = time.time() - saved_at
+    _probe["reachable"] = data.get("reachable")
+    _cache["heard_at"] = data.get("heard_at") or 0.0
+    if age <= TRUST_SAVED_SEC:
+        _reported["setpoint_dev"] = data.get("setpoint_dev")
+        _reported["power_dev"] = data.get("power_dev")
+    log.info("restored state from %.0f min ago: AC was %s", age / 60,
+             {True: "answering", False: "NOT answering", None: "unproven"}[
+                 _probe["reachable"]])
+
+
 def _set_reachable(value, why):
     """Record (and log once) whether the AC is answering us.
 
@@ -208,44 +266,57 @@ def _set_reachable(value, why):
     else:
         log.warning("AC is not answering (%s) — further commands will be refused "
                     "rather than reported as a false success", why)
+    _save_state()
 
 
 def _note_device_heard():
     """The AC spoke, so it is attached to the cloud and taking commands."""
     with _cache_lock:
         _cache["heard_at"] = time.time()
+        _probe["awaiting_since"] = 0.0
     _set_reachable(True, "dumping its datapoints")
 
 
 def _tick_reachability():
     """Called from the MQTT worker's idle loop (so, every IDLE_POLL_SEC).
 
-    Flips the belief on a long silence, and — only if the heartbeat is enabled —
-    prods a quiet unit so an outage is discovered before the next voice command
-    rather than by failing it.
+    Decides whether the AC is still on the cloud: after a long silence it prods
+    the unit, and only an unanswered prod marks it unreachable.
     """
     now = time.time()
     with _cache_lock:
         heard = _cache["heard_at"]
         last_probe = _probe["last_probe"]
-    if heard and now - heard >= OFFLINE_AFTER_SEC:
-        _set_reachable(False, "silent for %d min" % ((now - heard) // 60))
+        awaiting = _probe["awaiting_since"]
 
-    if not PROBE_ENABLED or now - heard < PROBE_SEC or now - last_probe < PROBE_SEC:
+    if awaiting:
+        if now - awaiting >= ANSWER_GRACE_SEC:
+            with _cache_lock:
+                _probe["awaiting_since"] = 0.0
+            _set_reachable(False, "no answer %ds after a prod" % ANSWER_GRACE_SEC)
+        return                       # still waiting: nothing decided yet
+
+    if not PROBE_ENABLED or now - heard < OFFLINE_AFTER_SEC:
         return
-    # The prod is the unit's *own* last reported setpoint — byte-identical to what
-    # the vendor app sends and a no-op for the MCU, but it always draws a dump.
-    # Requirements, both about not surprising the unit: the value must have come
-    # from the device itself (never a cached guess that would move the setpoint),
-    # and the unit must be running — an off unit is the most likely one to be
-    # quiet, and whether a setpoint command wakes it is untested.
+    if now - last_probe < PROBE_SEC:
+        return
+
+    # The prod is the unit's *own* last reported setpoint: byte-identical to what
+    # the vendor app sends, a no-op for the MCU (verified — the unit was still at
+    # 26C after two of these), and it always draws a dump. Two guards, both about
+    # not surprising the hardware: the value must have come from the device itself,
+    # never a cached guess that could move the setpoint; and the unit must have
+    # reported itself running, because whether a setpoint command wakes an idle
+    # unit is untested. While it reports itself off, nothing is prodded and no
+    # command is refused — the documented gap.
     setpoint = _reported["setpoint_dev"]
-    if setpoint is None or _desired["power"] != SinricProConstants.POWER_STATE_ON:
+    if setpoint is None or not _reported["power_dev"]:
         return
     with _cache_lock:
         _probe["last_probe"] = now
-    log.info("AC quiet for %ds — echoing its own setpoint (%d C) to prove it is "
-             "still there", int(now - heard), setpoint)
+        _probe["awaiting_since"] = now
+    log.info("AC silent for %d min — echoing its own setpoint (%d C) to ask whether "
+             "it is still there", int((now - heard) // 60), setpoint)
     send(h.temperature_payload(setpoint))
 
 
@@ -258,11 +329,11 @@ def _offline():
     no response at all (_callback_handler gates the reply on it), so the request
     times out and the assistant reports a failure, which is the truth.
 
-    Only a long silence refuses (see OFFLINE_AFTER_SEC) — a briefly quiet AC is
-    normal and still takes commands, so commands during the first minutes of an
-    outage do still go out optimistically. That is the deliberate trade: never
-    refuse a working unit, at the cost of a few optimistic commands before an
-    outage is established.
+    Only an unanswered prod refuses (see _tick_reachability) — a silent AC is
+    normal and still takes commands, so commands sent before an outage has been
+    established do still go out optimistically. That is the deliberate trade:
+    never refuse a working unit, at the cost of the first commands of an outage
+    being reported as successes.
     """
     if _probe["reachable"] is not False:
         return False
@@ -313,6 +384,7 @@ def _report_device_state(dps):
         state = (SinricProConstants.POWER_STATE_ON if power
                  else SinricProConstants.POWER_STATE_OFF)
         _state["power"] = state
+        _reported["power_dev"] = bool(power)    # device truth, for the prod guard
         _want("power", state)
 
     setpoint = dps.get(DP_SETPOINT)
@@ -429,8 +501,11 @@ def _on_ack(_topic, text):
     dps = h.parse_ack(text)
     if not dps:
         return
+    before = (_reported["setpoint_dev"], _reported["power_dev"])
     _cache_room_temp(dps.get(DP_ROOM_TEMP))
     _report_device_state(dps)
+    if (_reported["setpoint_dev"], _reported["power_dev"]) != before:
+        _save_state()                # so a restart can still prod with these
 
 
 def _worker():
@@ -645,6 +720,8 @@ def main():
     # constantly so that floods the journal. Send stdout to /dev/null — our logs
     # (and the SDK's) go to stderr, so they're unaffected.
     sys.stdout = open(os.devnull, "w")
+
+    _load_state()
 
     # start the MQTT worker (which also opens the state listener) before
     # accepting commands

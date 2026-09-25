@@ -50,10 +50,10 @@ and link "Sinric Pro" in the Google Home app.
 * State flows back both ways — a change made on the IR remote reaches Google too,
   because the unit dumps its datapoints and the bridge forwards them.
 * If the unit drops off Helium's cloud, commands **fail** instead of reporting a
-  false success: 15min of total silence on the ack topic is treated as offline and
-  commands are refused. The threshold is deliberately generous — a live unit
-  reports in bursts and can be silent for ~5min while still taking commands.
-  Diagnosis and the fix are in
+  false success. Silence alone is never taken as proof — a live unit reports in
+  bursts and can sit quiet for ~10min while still acting on commands — so after
+  15min of quiet the bridge prods the unit with its own setpoint, and refuses
+  commands only once a prod goes unanswered. Diagnosis and the fix are in
   [`bridge/README.md`](../bridge/README.md) → *Troubleshooting*.
 * Relative temperature ("make it cooler") isn't wired; use absolute ("set AC to 23").
 * Fan speed **is** wired (SinricPro's Range capability) but Google Home doesn't

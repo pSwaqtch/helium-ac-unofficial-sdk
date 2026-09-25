@@ -191,11 +191,12 @@ The AC shows up as a native thermostat: on/off, setpoint, cool/heat mode, and li
 indoor temperature ("set AC to 24", "set AC to cool"). State flows back the same
 way, so a change made on the IR remote updates Google too.
 
-Cloud commands are QoS-0 with no device ack, so the bridge leans on the unit's own
-datapoint dumps to know it is there: once the AC has gone properly silent (15min,
-measured against how a live unit actually behaves — it reports in bursts, not
-continuously), commands **fail** instead of reporting a false success that flips
-the Google tile while nothing reaches the unit. Diagnosis is in
+Cloud commands are QoS-0 with no device ack, so the bridge works out for itself
+whether the unit is there: a live AC reports in bursts and can sit silent for
+~10min while still acting on commands, so after a long quiet spell the bridge
+prods it with its own setpoint and only an unanswered prod counts. Once the AC is
+established as off the cloud, commands **fail** instead of reporting a false
+success that flips the Google tile while nothing reaches the unit. Diagnosis is in
 [`bridge/README.md`](bridge/README.md) → *Troubleshooting*.
 
 <p align="center">

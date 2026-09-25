@@ -101,29 +101,44 @@ Then:
   AC exposes no humidity, so humidity is reported as 0%.
 - **Commands fail honestly when the AC is off the cloud.** The cloud path is QoS-0
   with no device ack, so a publish "succeeds" locally whether or not the unit is
-  attached to hear it. The bridge therefore watches the ack topic: after
-  `OFFLINE_AFTER_SEC` (15min) of total silence it **refuses** commands instead of
-  reporting success, so Google reports a failure rather than flipping the tile over
-  a unit that never moved.
+  attached to hear it. Rather than assume, the bridge **asks**: after
+  `OFFLINE_AFTER_SEC` (15min) of silence on the ack topic it prods the unit, and if
+  the prod goes unanswered for `ANSWER_GRACE_SEC` (60s) it marks the AC unreachable
+  and **refuses** commands. Google then reports a failure instead of flipping the
+  tile over a unit that never moved.
 
-  The threshold is large on purpose, and it is measured — **a quiet AC is not a
-  dead AC**. The unit publishes a burst of ~7 dumps at 6s intervals and then goes
-  silent for minutes (gaps to ~5min observed on a unit that was answering
-  commands fine), and the answer to a command arrived 8s later once and ~25s later
-  another time. So neither a short silence nor "no answer within N seconds" is a
-  sound test, while 15min of silence is: the outage this was written for lasted two
-  days and answered nothing. The trade is deliberate — a working unit is never
-  refused, at the cost of the first few commands of an outage still being
-  optimistic.
-- **Optional reachability heartbeat.** Set `HELIUM_BRIDGE_PROBE=1` in `.env` to
-  make the bridge prod a quiet unit every `PROBE_SEC` (180s) by echoing back *the
-  setpoint the unit itself last reported* — byte-identical to what the vendor app
-  sends, and a no-op for the MCU, but it draws a dump. That turns 15min of ambiguity
-  into a ~3min check and keeps the room temperature Google shows fresh. Off by
-  default: it is a real publish to the hardware, and whether a repeated no-op
-  setpoint makes the unit beep (or wakes an idle one) is untested. It never fires
-  unless the unit reported itself **on** and the setpoint came from the device, so
-  it cannot invent a value or move your setpoint.
+  Asking is necessary because **a silent AC is not a dead AC** — measured, after
+  two cheaper designs turned out wrong:
+
+  | Test | Verdict |
+  |---|---|
+  | "quiet for 120s ⇒ offline" | **Wrong.** The unit publishes a burst of ~7 dumps 6s apart, then sleeps for many minutes. 9min of silence observed on a unit running at 272W that answered the next prod in 21.5s. Fleet-wide, a quarter of units send ≤2 messages in any 150s window. |
+  | "no answer within 8s of a command ⇒ offline" | **Wrong.** The same prod was answered after 8s, 21.5s and ~25s on three tries. |
+  | "no answer 60s after a prod ⇒ offline" | Sound. The outage this was written for answered nothing for two days. |
+
+  The trade is deliberate: a working unit is never refused, at the cost of the
+  commands sent before an outage is established still reporting success.
+- **The prod, and how to turn it off.** It re-sends *the setpoint the unit itself
+  last reported* — byte-identical to what the vendor app sends, a no-op for the MCU
+  (verified: the unit was still at 26 °C after two of them), and it reliably draws a
+  dump. It fires at most every `PROBE_SEC` (180s) and only while the AC stays
+  silent, so a live unit sees roughly one prod per 15min; answering it resets the
+  clock. Two guards keep it from surprising the hardware: the value must have come
+  from the device (never a cached guess that could move your setpoint), and the
+  unit must have reported itself **on** — whether a setpoint command wakes an idle
+  unit is untested, so while the AC reports itself off nothing is prodded and no
+  command is refused. `HELIUM_BRIDGE_PROBE=0` in `.env` stops the bridge publishing
+  anything on its own, which also removes its only evidence for refusing — it then
+  reports every command as a success, as it did before this was added.
+- **The verdict survives a restart.** systemd restarts this process on a dead
+  SinricPro socket a couple of times a day, and an outage outlives that easily (the
+  original lasted two days), so a forgetful bridge would go straight back to
+  reporting false successes. The verdict and the device-reported values the prod
+  needs are cached in `~/.cache/helium-sinricpro-state.json`
+  (`HELIUM_BRIDGE_STATE` moves it). Only the AC speaking again clears a saved
+  "not answering", so a restart cannot launder a dead unit back into looking
+  healthy — and a saved setpoint older than an hour is dropped rather than echoed
+  at a unit whose setpoint may have moved in the meantime.
 - **State flows back both ways.** The unit dumps its datapoints whenever something
   changes — including changes made on the IR remote — so Google follows the AC, not
   just the commands this bridge sent.
@@ -174,10 +189,14 @@ fix is at the AC, not here:
 The vendor app will be just as dead while this is true, which confirms the unit is
 at fault. `AC is answering (dumping its datapoints)` in the log means it is back.
 
-Note what is **not** a fault: `AC is answering` followed by minutes of no log
-lines at all. The unit reports in bursts and then sleeps; it still takes commands
-in between (verified — a command landed on a unit that had been silent for over
-ten minutes). Only the 15-minute refusal line means something is actually wrong.
+`restored state from N min ago: AC was NOT answering` on startup means the
+previous run had already established an outage; it stands until the unit speaks.
+
+Note what is **not** a fault: `AC is answering` followed by many minutes of no log
+lines at all, or an occasional `AC silent for 15 min — echoing its own setpoint …`
+followed by `AC is answering`. The unit reports in bursts and then sleeps; it still
+takes commands in between (verified — silent for 9min, answered the next prod in
+21.5s). Only `AC is not answering` means something is actually wrong.
 
 To prove it is your unit and not this project or the vendor cloud: the shipped
 `AWSiOT.p12` is a **fleet-wide** cert, so you can compare your AC against every
