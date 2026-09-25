@@ -45,12 +45,20 @@ and link "Sinric Pro" in the Google Home app.
 
 ### Limits
 
-* Indoor temperature **is** reported to Google (room-temp DP, refreshed periodically
-  and on every command); humidity shows 0% (the AC has no humidity sensor).
-* Power/setpoint *displayed* state reflects the last command the bridge sent, not a
-  live read — the device's cloud state dump is intermittent by design (see main README).
+* Indoor temperature **is** reported to Google, from the datapoint dumps the AC
+  pushes to its ack topic; humidity shows 0% (the AC has no humidity sensor).
+* State flows back both ways — a change made on the IR remote reaches Google too,
+  because the unit dumps its datapoints and the bridge forwards them.
+* If the unit drops off Helium's cloud, commands **fail** instead of reporting a
+  false success: 15min of total silence on the ack topic is treated as offline and
+  commands are refused. The threshold is deliberately generous — a live unit
+  reports in bursts and can be silent for ~5min while still taking commands.
+  Diagnosis and the fix are in
+  [`bridge/README.md`](../bridge/README.md) → *Troubleshooting*.
 * Relative temperature ("make it cooler") isn't wired; use absolute ("set AC to 23").
-* Fan / swing / turbo aren't exposed yet — see below.
+* Fan speed **is** wired (SinricPro's Range capability) but Google Home doesn't
+  render it — it works from the SinricPro app and Alexa. Swing / turbo etc. aren't
+  exposed — see below.
 
 ### Future: more controls
 

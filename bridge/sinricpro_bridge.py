@@ -60,6 +60,14 @@ APP_KEY = os.environ.get("SINRICPRO_APP_KEY", "")
 APP_SECRET = os.environ.get("SINRICPRO_APP_SECRET", "")
 DEVICE_ID = os.environ.get("SINRICPRO_AC_DEVICE_ID", "")
 
+# Opt-in reachability heartbeat (HELIUM_BRIDGE_PROBE=1 in .env). While the AC is
+# quiet it echoes the unit's own setpoint back every PROBE_SEC, so an outage is
+# discovered before the next voice command instead of by failing it. Off by
+# default: it is a real publish to the unit, and whether a no-op setpoint makes it
+# beep (or wakes an idle unit) is untested — see bridge/README.md.
+PROBE_ENABLED = os.environ.get("HELIUM_BRIDGE_PROBE", "").strip().lower() in (
+    "1", "true", "yes", "on")
+
 TEMP_MIN, TEMP_MAX = 16, 30          # unit's accepted setpoint range (README)
 DEFAULT_MODE = "cool"                # what AUTO / a bare power-on maps to
 
@@ -104,6 +112,24 @@ TEMP_INTERVAL_SEC = 300              # ambient temp: at most this often, on chan
 RECONCILE_SEC = 600                  # re-assert full state this often
 STALE_SEC = 900                      # stop reporting a reading older than this
 IDLE_POLL_SEC = 5                    # how long the worker waits for a command
+
+# Reachability, and why the threshold is this large. MEASURED against the real
+# unit, because the obvious guesses are both wrong:
+#
+#   * The AC does NOT chatter continuously. It publishes a burst of ~7 dumps at
+#     6s intervals and then goes silent for minutes — observed gaps up to ~5min
+#     on a unit that was demonstrably alive and controllable. Fleet-wide, about a
+#     quarter of units send ≤2 messages in any 150s window.
+#   * A command is not answered on a predictable schedule either: the same no-op
+#     publish drew a dump 8s later once and ~25s later another time.
+#
+# So a short quiet window means nothing, and "no answer within N seconds" is not
+# a sound test at any N small enough to gate a voice command on. What *is* sound
+# is a long silence: the real outage that motivated all this lasted two days and
+# answered nothing at all. 15min is ~3x the longest silence seen from a live unit,
+# so it never refuses a working AC, and it still catches a dead one in minutes.
+OFFLINE_AFTER_SEC = 900              # silence this long = genuinely off the cloud
+PROBE_SEC = 180                      # opt-in heartbeat: re-prove a quiet unit
 WATCHDOG_SEC = 20                    # how often to check the SinricPro socket
 WATCHDOG_GRACE = 45                  # let the first connection settle before watching
 
@@ -114,17 +140,23 @@ _state = {"power": "Off", "setpoint": 24, "mode": DEFAULT_MODE}
 # something changes — including changes made on the IR remote, which never touch
 # this bridge — so this is how we learn about them. `None` until the device has
 # actually told us (so we never report a fabricated value).
-_cache = {"room_temp": None, "room_temp_at": 0.0}
+_cache = {"room_temp": None, "room_temp_at": 0.0, "heard_at": 0.0}
 _cache_lock = threading.Lock()
+
+# `reachable` is the last *logged* belief, so a unit that is off the cloud for
+# days costs two log lines rather than thousands; `last_probe` paces the opt-in
+# heartbeat below.
+_probe = {"last_probe": 0.0, "reachable": None}
 
 # What the AC actually is (`_desired`) versus what SinricPro has been told
 # (`_sent`). The reporter thread closes the gap one event at a time, within the
 # pacing budget above. `mode_dp` is the raw DP, kept to derive the Google mode.
 _desired = {"power": None, "setpoint": None, "mode": None, "fan": None, "temp": None}
 _sent = {"power": None, "setpoint": None, "mode": None, "fan": None, "temp": None}
-_reported = {"mode_dp": None}
+_reported = {"mode_dp": None, "setpoint_dev": None}
 _desired_at = 0.0                    # when _desired last changed (for debounce)
-_send_state = {"last_send": 0.0, "last_temp": 0.0, "last_reconcile": time.time()}
+_send_state = {"last_send": 0.0, "last_temp": 0.0, "last_reconcile": time.time(),
+               "last_stale_log": 0.0}
 
 # set once the SinricPro client exists, so the async reporter can raise events
 _client = None
@@ -160,6 +192,86 @@ def _cache_room_temp(t):
             _cache["room_temp"] = t
             _cache["room_temp_at"] = time.time()
         _want("temp", t)
+
+
+def _set_reachable(value, why):
+    """Record (and log once) whether the AC is answering us.
+
+    Deliberately lock-free: it only rebinds one dict key, and a lost race costs a
+    duplicate log line at worst. Callers may hold _cache_lock.
+    """
+    if _probe["reachable"] is value:
+        return
+    _probe["reachable"] = value
+    if value:
+        log.info("AC is answering (%s)", why)
+    else:
+        log.warning("AC is not answering (%s) — further commands will be refused "
+                    "rather than reported as a false success", why)
+
+
+def _note_device_heard():
+    """The AC spoke, so it is attached to the cloud and taking commands."""
+    with _cache_lock:
+        _cache["heard_at"] = time.time()
+    _set_reachable(True, "dumping its datapoints")
+
+
+def _tick_reachability():
+    """Called from the MQTT worker's idle loop (so, every IDLE_POLL_SEC).
+
+    Flips the belief on a long silence, and — only if the heartbeat is enabled —
+    prods a quiet unit so an outage is discovered before the next voice command
+    rather than by failing it.
+    """
+    now = time.time()
+    with _cache_lock:
+        heard = _cache["heard_at"]
+        last_probe = _probe["last_probe"]
+    if heard and now - heard >= OFFLINE_AFTER_SEC:
+        _set_reachable(False, "silent for %d min" % ((now - heard) // 60))
+
+    if not PROBE_ENABLED or now - heard < PROBE_SEC or now - last_probe < PROBE_SEC:
+        return
+    # The prod is the unit's *own* last reported setpoint — byte-identical to what
+    # the vendor app sends and a no-op for the MCU, but it always draws a dump.
+    # Requirements, both about not surprising the unit: the value must have come
+    # from the device itself (never a cached guess that would move the setpoint),
+    # and the unit must be running — an off unit is the most likely one to be
+    # quiet, and whether a setpoint command wakes it is untested.
+    setpoint = _reported["setpoint_dev"]
+    if setpoint is None or _desired["power"] != SinricProConstants.POWER_STATE_ON:
+        return
+    with _cache_lock:
+        _probe["last_probe"] = now
+    log.info("AC quiet for %ds — echoing its own setpoint (%d C) to prove it is "
+             "still there", int(now - heard), setpoint)
+    send(h.temperature_payload(setpoint))
+
+
+def _offline():
+    """Guard for every command callback: refuse rather than lie.
+
+    Reporting success for a command the AC never received is the worst failure
+    mode this bridge has — the Google tile flips, the unit never moves, and
+    nothing anywhere says so. Returning a falsy first element makes the SDK send
+    no response at all (_callback_handler gates the reply on it), so the request
+    times out and the assistant reports a failure, which is the truth.
+
+    Only a long silence refuses (see OFFLINE_AFTER_SEC) — a briefly quiet AC is
+    normal and still takes commands, so commands during the first minutes of an
+    outage do still go out optimistically. That is the deliberate trade: never
+    refuse a working unit, at the cost of a few optimistic commands before an
+    outage is established.
+    """
+    if _probe["reachable"] is not False:
+        return False
+    with _cache_lock:
+        last = _cache["heard_at"]
+    ago = "never" if not last else "%ds ago" % int(time.time() - last)
+    log.warning("AC is not answering (last heard %s) — refusing the command rather "
+                "than reporting a false success", ago)
+    return True
 
 
 def _raise(event, data, what):
@@ -206,6 +318,7 @@ def _report_device_state(dps):
     setpoint = dps.get(DP_SETPOINT)
     if setpoint is not None and TEMP_MIN <= setpoint <= TEMP_MAX:
         _state["setpoint"] = setpoint
+        _reported["setpoint_dev"] = setpoint    # device-sourced: safe to echo back
         _want("setpoint", setpoint)
 
     fan = dps.get(DP_FAN)
@@ -253,7 +366,12 @@ def _temp_sendable(now):
     with _cache_lock:
         age = now - _cache["room_temp_at"]
     if age > STALE_SEC:
-        log.warning("room temp is %d min old — not reporting", age // 60)
+        # last_temp is only advanced on a real send, so this branch is reached on
+        # every tick once the interval has passed — log it at the same cadence we
+        # would have sent at, or a quiet unit fills the journal.
+        if now - _send_state["last_stale_log"] >= TEMP_INTERVAL_SEC:
+            _send_state["last_stale_log"] = now
+            log.warning("room temp is %d min old — not reporting", age // 60)
         return False
     return True
 
@@ -307,6 +425,7 @@ def _on_ack(_topic, text):
     The device pushes one of these whenever a DP changes, so this is the only
     place a remote-control change can enter the bridge.
     """
+    _note_device_heard()
     dps = h.parse_ack(text)
     if not dps:
         return
@@ -340,6 +459,7 @@ def _worker():
             # so just note a drop rather than tearing the client down under it
             if not cli.is_connected():
                 log.warning("AWS IoT link down — paho is reconnecting")
+            _tick_reachability()
             continue
 
         for attempt in (1, 2):
@@ -416,6 +536,8 @@ def on_power_state(device_id, state):
     """state is "On" / "Off"."""
     on = (state == SinricProConstants.POWER_STATE_ON)
     log.info("power -> %s", state)
+    if _offline():
+        return False, state
     send(h.power_payload(on))
     _state["power"] = state
     _assume("power", state)
@@ -427,6 +549,8 @@ def on_target_temperature(device_id, temperature):
     """Absolute setpoint, e.g. "set AC to 24"."""
     t = _clamp_temp(temperature)
     log.info("setpoint -> %d C", t)
+    if _offline():
+        return False, t
     send(h.temperature_payload(t))
     _state["setpoint"] = t
     _assume("setpoint", t)
@@ -442,6 +566,8 @@ def on_set_range_value(device_id, range_value, instance_id=None):
         return False, range_value
     idx = max(0, min(len(FAN_BY_INDEX) - 1, idx))
     log.info("fan -> %s", FAN_BY_INDEX[idx])
+    if _offline():
+        return False, idx
     send(h.fan_payload(FAN_BY_INDEX[idx]))
     _state["fan"] = FAN_BY_INDEX[idx]
     _assume("fan", idx)
@@ -457,6 +583,8 @@ def on_set_thermostat_mode(device_id, mode):
     """
     mode = (mode or "").upper()
     log.info("mode -> %s", mode)
+    if _offline():
+        return False, mode
     if mode == SinricProConstants.THERMOSTAT_MODE_OFF:
         send(h.power_payload(False))
         _state["power"] = "Off"
@@ -479,10 +607,25 @@ def on_set_thermostat_mode(device_id, mode):
 
 
 def main():
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    # Timestamps: under systemd, journald already stamps every line — and it
+    # renders in the *reader's* timezone, so `TZ=Asia/Kolkata journalctl …` shows
+    # IST on a box that (correctly) stays on UTC. Our own %(asctime)s would bake
+    # the box's UTC into the message and put two times 5:30 apart on one line, so
+    # keep it only when running in a terminal, where there is no journal.
+    under_systemd = bool(os.environ.get("JOURNAL_STREAM"))
+    fmt = "%(levelname)s %(name)s: %(message)s"
+    if not under_systemd:
+        fmt = "%(asctime)s " + fmt
+    logging.basicConfig(level=logging.INFO, format=fmt)
+
+    # The SDK logs through loguru, which stamps its own lines too; same reasoning.
+    if under_systemd:
+        try:
+            from loguru import logger as _loguru
+            _loguru.remove()
+            _loguru.add(sys.stderr, format="{level} sinric: {message}", level="INFO")
+        except Exception as e:  # noqa: BLE001 — cosmetic only, never fail startup
+            log.debug("could not restyle the SDK logger: %s", e)
 
     missing = [n for n, v in (
         ("SINRICPRO_APP_KEY", APP_KEY),
